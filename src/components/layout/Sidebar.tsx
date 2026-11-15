@@ -38,14 +38,12 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpenMobile, onCloseMobile })
     activeModule,
     navigateToModule,
     currentUser,
-    switchUserRole,
     inventory,
     medicines,
     store,
     activeBranch,
     consolidatedViewMode,
     setIsStoreOnboardingOpen,
-    firebaseSession,
   } = usePharmacy();
 
   const visibleDestinations = getVisiblePrimaryDestinations(currentUser.role);
@@ -181,35 +179,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpenMobile, onCloseMobile })
           })}
         </nav>
 
-        {/* Footer: Dev Preview Role Switcher (Hidden in Production / Live Auth) + Staff Profile */}
+        {/* Staff Profile Footer */}
         <div className="p-3 border-t border-slate-800 bg-slate-950/70">
-          {!import.meta.env.PROD && !firebaseSession.authenticated && (
-            <div className="mb-3">
-              <div className="mb-1.5 flex items-center justify-between text-[11px]">
-                <span className="text-slate-400">Preview Role:</span>
-                <span className="font-semibold text-blue-400 capitalize">
-                  {currentUser.role === 'owner' ? 'Store Owner' : currentUser.role}
-                </span>
-              </div>
-
-              <div className="grid grid-cols-5 gap-0.5 p-1 bg-slate-900 rounded-lg text-[10px] font-medium border border-slate-800">
-                {(['owner', 'pharmacist', 'cashier', 'helper', 'auditor'] as const).map(role => (
-                  <button
-                    key={role}
-                    onClick={() => switchUserRole(role)}
-                    className={`py-1 rounded text-center transition-colors cursor-pointer capitalize ${
-                      currentUser.role === role
-                        ? 'bg-blue-600 text-white font-semibold'
-                        : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    {role === 'pharmacist' ? 'Pharm' : role === 'auditor' ? 'Audit' : role}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
           <div className="flex items-center gap-2.5 pt-0.5">
             <div className="w-8 h-8 rounded-full bg-slate-700 border border-slate-600 flex items-center justify-center font-semibold text-xs text-white shrink-0">
               {currentUser.name.charAt(0)}
@@ -218,8 +189,12 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpenMobile, onCloseMobile })
               <span className="text-xs font-semibold text-slate-200 block truncate">
                 {currentUser.name}
               </span>
-              <span className="text-[10px] text-slate-400 block truncate capitalize">
-                {currentUser.role === 'owner' ? 'Store Owner' : currentUser.role}
+              <span className="text-[10px] text-slate-400 block truncate">
+                {currentUser.role === 'owner'
+                  ? 'Pharmacy Owner'
+                  : currentUser.role === 'helper'
+                  ? 'Store Helper'
+                  : currentUser.role.charAt(0).toUpperCase() + currentUser.role.slice(1)}
               </span>
             </div>
           </div>

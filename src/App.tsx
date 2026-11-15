@@ -4,15 +4,14 @@
  */
 
 import React, { Suspense, lazy, useCallback, useEffect, useState } from 'react';
-import { AlertTriangle, Lock, ArrowLeft } from 'lucide-react';
+import { AlertTriangle, Lock, ArrowLeft, Building2, LogOut, Ban } from 'lucide-react';
 import { PharmacyProvider, usePharmacy } from './context/PharmacyContext.tsx';
 import { Sidebar } from './components/layout/Sidebar.tsx';
 import { TopHeader } from './components/layout/TopHeader.tsx';
 import { NotificationsDrawer } from './components/layout/NotificationsDrawer.tsx';
-
 import { MobileBottomNav } from './components/layout/MobileBottomNav.tsx';
 
-// Modals
+// Modals & Onboarding Views
 import { StoreOnboardingModal } from './components/modals/StoreOnboardingModal.tsx';
 import { LoginModal } from './components/modals/LoginModal.tsx';
 import { AddMedicineModal } from './components/modals/AddMedicineModal.tsx';
@@ -20,8 +19,9 @@ import { AddCustomerModal } from './components/modals/AddCustomerModal.tsx';
 import { AddStockModal } from './components/modals/AddStockModal.tsx';
 import { PrintInvoiceModal } from './components/modals/PrintInvoiceModal.tsx';
 import { WorkspaceOnboardingView } from './components/modals/WorkspaceOnboardingView.tsx';
+import { JoinPharmacyPage } from './pages/JoinPharmacyPage.tsx';
 
-// Code-split authenticated workspace views (keeps initial marketing & POS load light)
+// Code-split authenticated workspace views
 const DashboardView = lazy(() =>
   import('./features/dashboard/DashboardView.tsx').then((m) => ({ default: m.DashboardView }))
 );
@@ -88,29 +88,7 @@ const LegalPage = lazy(() =>
   import('./pages/marketing/LegalPage.tsx').then((m) => ({ default: m.LegalPage }))
 );
 
-function parseInviteParams(pathname: string, search: string): { token: string; tenantId?: string } | null {
-  const qs = new URLSearchParams(search);
-  const match = pathname.match(/^\/invite\/([^/]+)/);
-  if (match && match[1]) {
-    return {
-      token: decodeURIComponent(match[1]),
-      tenantId: qs.get('tenantId') || undefined,
-    };
-  }
-  const queryToken = qs.get('token');
-  if (pathname.startsWith('/invite') && queryToken) {
-    return {
-      token: queryToken,
-      tenantId: qs.get('tenantId') || undefined,
-    };
-  }
-  return null;
-}
-
 function normalizeRoutePath(pathname: string): MarketingRoutePath {
-  if (pathname.startsWith('/invite')) {
-    return '/app';
-  }
   const clean = pathname.replace(/\/+$/, '') || '/';
   switch (clean) {
     case '/':
@@ -127,6 +105,8 @@ function normalizeRoutePath(pathname: string): MarketingRoutePath {
       return '/privacy';
     case '/terms':
       return '/terms';
+    case '/join-pharmacy':
+      return '/join-pharmacy';
     case '/app':
       return '/app';
     default:
@@ -135,7 +115,8 @@ function normalizeRoutePath(pathname: string): MarketingRoutePath {
 }
 
 const MainLayout: React.FC<{ onReturnToSite: () => void }> = ({ onReturnToSite }) => {
-  const { activeModule, activeBranch, consolidatedViewMode, workspaceError, setWorkspaceError } = usePharmacy();
+  const { activeModule, activeBranch, consolidatedViewMode, workspaceError, setWorkspaceError } =
+    usePharmacy();
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
 
@@ -177,22 +158,18 @@ const MainLayout: React.FC<{ onReturnToSite: () => void }> = ({ onReturnToSite }
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col antialiased text-slate-900">
       <div className="flex-1 flex overflow-hidden">
-        {/* Sidebar Navigation */}
         <Sidebar
           isOpenMobile={isMobileMenuOpen}
           onCloseMobile={() => setIsMobileMenuOpen(false)}
         />
 
-        {/* Content Viewport Area */}
         <div className="flex-1 flex flex-col min-w-0 h-screen overflow-y-auto">
-          {/* Top Header */}
           <TopHeader
             onToggleMobileMenu={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
             onOpenNotifications={() => setIsNotificationsOpen(true)}
             onReturnToSite={onReturnToSite}
           />
 
-          {/* Main Content View */}
           <main className="flex-1 p-4 lg:p-6 max-w-7xl w-full mx-auto pb-24 lg:pb-12">
             {workspaceError && (
               <div className="mb-4 bg-red-50 border border-red-200 rounded-xl px-4 py-3 flex items-center justify-between gap-3 text-xs text-red-900">
@@ -217,8 +194,8 @@ const MainLayout: React.FC<{ onReturnToSite: () => void }> = ({ onReturnToSite }
                     {activeBranch.name} ({activeBranch.branchCode}) is {activeBranch.status}
                   </span>
                   <span className="text-amber-800 block mt-0.5">
-                    POS billing, inventory inward, expenses, and transfers are locked for this
-                    branch. Historical reports and audit logs remain readable.
+                    POS billing, stock inward, expenses, and transfers are locked for this
+                    branch. Historical reports and records remain readable.
                   </span>
                 </div>
               </div>
@@ -236,16 +213,13 @@ const MainLayout: React.FC<{ onReturnToSite: () => void }> = ({ onReturnToSite }
         </div>
       </div>
 
-      {/* Mobile Bottom Navigation */}
       <MobileBottomNav />
 
-      {/* Notifications Drawer */}
       <NotificationsDrawer
         isOpen={isNotificationsOpen}
         onClose={() => setIsNotificationsOpen(false)}
       />
 
-      {/* Workspace Modals */}
       <StoreOnboardingModal />
       <AddMedicineModal />
       <AddCustomerModal />
@@ -256,24 +230,28 @@ const MainLayout: React.FC<{ onReturnToSite: () => void }> = ({ onReturnToSite }
 };
 
 const AppShell: React.FC = () => {
-  const { firebaseSession, memberships, setIsLoginModalOpen } = usePharmacy();
-  const [pendingInvite] = useState<{ token: string; tenantId?: string } | null>(() =>
-    typeof window !== 'undefined'
-      ? parseInviteParams(window.location.pathname, window.location.search)
-      : null
-  );
+  const {
+    firebaseSession,
+    memberships,
+    inactiveMemberships,
+    switchWorkspace,
+    signOutSession,
+    setIsLoginModalOpen,
+  } = usePharmacy();
+
   const [route, setRoute] = useState<MarketingRoutePath>(() =>
     typeof window !== 'undefined' ? normalizeRoutePath(window.location.pathname) : '/'
   );
   const [contactInquiryType, setContactInquiryType] = useState<PublicInquiryType>('BOOK_DEMO');
+  const [workspaceChosenForSession, setWorkspaceChosenForSession] = useState(false);
 
   usePageSeo(route);
 
   useEffect(() => {
-    if (pendingInvite && typeof window !== 'undefined' && window.location.pathname.startsWith('/invite')) {
-      window.history.replaceState({}, '', '/app');
+    if (!firebaseSession.authenticated || memberships.length <= 1) {
+      setWorkspaceChosenForSession(false);
     }
-  }, [pendingInvite]);
+  }, [firebaseSession.authenticated, memberships.length]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -335,66 +313,182 @@ const AppShell: React.FC = () => {
     }
   };
 
-  const isProdWorkspaceLocked =
-    route === '/app' && import.meta.env.PROD && !firebaseSession.authenticated;
-  const needsWorkspaceOnboarding =
-    route === '/app' && firebaseSession.authenticated && memberships.length === 0;
+  const renderWorkspaceContent = () => {
+    if (firebaseSession.authLoading) {
+      return (
+        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-2xl p-8 max-w-sm w-full text-center space-y-2 shadow-xs">
+            <div className="w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto" />
+            <p className="text-sm font-semibold text-slate-900">Opening your pharmacy...</p>
+            <p className="text-xs text-slate-500">Checking your account and store access.</p>
+          </div>
+        </div>
+      );
+    }
+
+    if (!firebaseSession.authenticated) {
+      return (
+        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+          <div className="max-w-md w-full bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 space-y-5 text-center shadow-xs">
+            <div className="w-12 h-12 rounded-xl bg-blue-50 border border-blue-100 text-blue-700 flex items-center justify-center mx-auto">
+              <Lock className="w-6 h-6" />
+            </div>
+            <div className="space-y-2">
+              <h1 className="text-xl font-bold text-slate-900">
+                Welcome to PharmaDesk
+              </h1>
+              <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
+                Sign in to open your pharmacy, create a new pharmacy account, or join an existing store with a joining code.
+              </p>
+            </div>
+            <div className="flex flex-col gap-2.5">
+              <button
+                type="button"
+                onClick={() => setIsLoginModalOpen(true)}
+                className="w-full py-2.5 px-4 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold transition-colors"
+              >
+                Sign In or Create Account
+              </button>
+              <button
+                type="button"
+                onClick={() => navigateTo('/join-pharmacy')}
+                className="w-full py-2.5 px-4 rounded-lg border border-slate-300 bg-slate-50 hover:bg-slate-100 text-slate-800 text-sm font-semibold transition-colors inline-flex items-center justify-center gap-2"
+              >
+                <Building2 className="w-4 h-4 text-blue-600" />
+                <span>Join Existing Pharmacy</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => navigateTo('/')}
+                className="w-full py-2 px-4 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 inline-flex items-center justify-center gap-1.5"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+                <span>Return to Website</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    if (memberships.length === 0 && inactiveMemberships.length > 0) {
+      return (
+        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+          <div className="max-w-md w-full bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 space-y-5 text-center shadow-xs">
+            <div className="w-12 h-12 rounded-xl bg-amber-50 border border-amber-200 text-amber-700 flex items-center justify-center mx-auto">
+              <Ban className="w-6 h-6" />
+            </div>
+            <div className="space-y-2">
+              <h1 className="text-lg font-bold text-slate-900">
+                Your pharmacy access has been paused. Contact your owner.
+              </h1>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Signed in as {firebaseSession.email}. Your previous store access is currently{' '}
+                {inactiveMemberships[0]?.status || 'paused'}.
+              </p>
+            </div>
+            <div className="flex flex-col gap-2.5">
+              <button
+                type="button"
+                onClick={() => navigateTo('/join-pharmacy')}
+                className="w-full py-2.5 px-4 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold"
+              >
+                Join Another Pharmacy with Code
+              </button>
+              <button
+                type="button"
+                onClick={() => void signOutSession()}
+                className="w-full py-2.5 px-4 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-xs font-semibold inline-flex items-center justify-center gap-1.5"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Sign Out</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    if (memberships.length === 0) {
+      return (
+        <WorkspaceOnboardingView
+          onReturnToSite={() => navigateTo('/')}
+          onOpenJoinPharmacy={() => navigateTo('/join-pharmacy')}
+        />
+      );
+    }
+
+    if (memberships.length > 1 && !workspaceChosenForSession) {
+      return (
+        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+          <div className="max-w-md w-full bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 space-y-5 shadow-xs">
+            <div className="space-y-1">
+              <h1 className="text-lg font-bold text-slate-900">Choose Your Pharmacy</h1>
+              <p className="text-xs text-slate-500">
+                Select which pharmacy you want to open now.
+              </p>
+            </div>
+
+            <div className="space-y-2.5">
+              {memberships.map((m) => (
+                <button
+                  key={m.tenantId}
+                  type="button"
+                  onClick={() => {
+                    setWorkspaceChosenForSession(true);
+                    void switchWorkspace(m.tenantId);
+                  }}
+                  className="w-full p-3.5 rounded-xl border border-slate-200 hover:border-blue-500 hover:bg-blue-50/40 text-left flex items-center justify-between gap-3 transition-colors"
+                >
+                  <div className="min-w-0">
+                    <div className="text-sm font-bold text-slate-900 truncate">
+                      {m.tenantName || m.tenantId}
+                    </div>
+                    <div className="text-xs text-slate-500 capitalize mt-0.5">
+                      Role: {m.role === 'owner' ? 'Pharmacy Owner' : m.role}
+                    </div>
+                  </div>
+                  <span className="text-xs font-semibold text-blue-600 shrink-0">Open →</span>
+                </button>
+              ))}
+            </div>
+
+            <div className="pt-3 border-t border-slate-100 flex items-center justify-between text-xs">
+              <button
+                type="button"
+                onClick={() => navigateTo('/join-pharmacy')}
+                className="font-semibold text-blue-600 hover:text-blue-700"
+              >
+                + Join Another Pharmacy
+              </button>
+              <button
+                type="button"
+                onClick={() => void signOutSession()}
+                className="font-semibold text-slate-600 hover:text-slate-900"
+              >
+                Sign Out
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    return <MainLayout onReturnToSite={() => navigateTo('/')} />;
+  };
 
   return (
     <>
       {route === '/app' ? (
-        firebaseSession.authLoading ? (
-          <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
-            <div className="bg-white border border-slate-200 rounded-2xl p-8 max-w-sm w-full text-center space-y-2 shadow-xs">
-              <div className="w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto" />
-              <p className="text-sm font-semibold text-slate-900">Verifying pharmacy session...</p>
-              <p className="text-xs text-slate-500">Checking Firebase authentication and store access.</p>
-            </div>
-          </div>
-        ) : isProdWorkspaceLocked ? (
-          <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
-            <div className="max-w-md w-full bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 space-y-5 text-center shadow-xs">
-              <div className="w-12 h-12 rounded-xl bg-blue-50 border border-blue-100 text-blue-700 flex items-center justify-center mx-auto">
-                <Lock className="w-6 h-6" />
-              </div>
-              <div className="space-y-2">
-                <h1 className="text-xl font-bold text-slate-900">
-                  Sign In to PharmaDesk Workspace
-                </h1>
-                <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
-                  {pendingInvite
-                    ? 'Sign in or create a staff account with Firebase Authentication to accept your pharmacy invitation.'
-                    : 'Staff authentication via Firebase Authentication is required to access your pharmacy\'s billing, stock, and accounting workspace.'}
-                </p>
-              </div>
-              <div className="flex flex-col gap-2.5">
-                <button
-                  type="button"
-                  onClick={() => setIsLoginModalOpen(true)}
-                  className="w-full py-2.5 px-4 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold transition-colors"
-                >
-                  Open Staff Sign In
-                </button>
-                <button
-                  type="button"
-                  onClick={() => navigateTo('/')}
-                  className="w-full py-2 px-4 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 inline-flex items-center justify-center gap-1.5"
-                >
-                  <ArrowLeft className="w-3.5 h-3.5" />
-                  <span>Return to Public Website</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        ) : needsWorkspaceOnboarding ? (
-          <WorkspaceOnboardingView
-            initialInviteToken={pendingInvite?.token}
-            initialInviteTenantId={pendingInvite?.tenantId}
-            onReturnToSite={() => navigateTo('/')}
-          />
-        ) : (
-          <MainLayout onReturnToSite={() => navigateTo('/')} />
-        )
+        renderWorkspaceContent()
+      ) : route === '/join-pharmacy' ? (
+        <JoinPharmacyPage
+          onBackToSite={() => navigateTo('/')}
+          onJoinedWorkspace={() => {
+            setWorkspaceChosenForSession(true);
+            navigateTo('/app');
+          }}
+        />
       ) : (
         <div className="min-h-screen bg-white text-slate-900 flex flex-col antialiased">
           <MarketingHeader
@@ -426,8 +520,10 @@ const AppShell: React.FC = () => {
         </div>
       )}
 
-      {/* Root-mounted LoginModal accessible from both public marketing site and /app workspace */}
-      <LoginModal onEnterWorkspace={() => navigateTo('/app')} />
+      <LoginModal
+        onEnterWorkspace={() => navigateTo('/app')}
+        onJoinPharmacy={() => navigateTo('/join-pharmacy')}
+      />
     </>
   );
 };

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useMemo, useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   Building2,
   CheckCircle2,
@@ -11,26 +11,22 @@ import {
   LogOut,
   Mail,
   RefreshCw,
-  ShieldCheck,
   AlertCircle,
   ArrowLeft,
 } from 'lucide-react';
 import { usePharmacy } from '../../context/PharmacyContext.tsx';
-import { workspaceApi } from '../../lib/workspaceApi.ts';
+import { JoiningCodePreview, workspaceApi } from '../../lib/workspaceApi.ts';
+import { generateIdempotencyKey } from '../../lib/customerApi.ts';
 import { reloadFirebaseUser, resendVerificationEmail } from '../../lib/firebaseClient.ts';
 
 interface WorkspaceOnboardingViewProps {
-  initialInviteToken?: string | null;
-  initialInviteTenantId?: string | null;
-  onClearPendingInvite?: () => void;
   onReturnToSite: () => void;
+  onOpenJoinPharmacy?: () => void;
 }
 
 export const WorkspaceOnboardingView: React.FC<WorkspaceOnboardingViewProps> = ({
-  initialInviteToken,
-  initialInviteTenantId,
-  onClearPendingInvite,
   onReturnToSite,
+  onOpenJoinPharmacy,
 }) => {
   const {
     firebaseSession,
@@ -40,18 +36,14 @@ export const WorkspaceOnboardingView: React.FC<WorkspaceOnboardingViewProps> = (
     switchWorkspace,
   } = usePharmacy();
 
-  const [mode, setMode] = useState<'create' | 'invite'>(
-    initialInviteToken || initialInviteTenantId ? 'invite' : 'create'
-  );
+  const [mode, setMode] = useState<'create' | 'join'>('create');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [verificationBusy, setVerificationBusy] = useState(false);
 
-  // Create Pharmacy Form State
+  // Create Pharmacy Form State (no manual slug exposed)
   const [name, setName] = useState('');
-  const [tenantId, setTenantId] = useState('');
-  const [tenantIdEdited, setTenantIdEdited] = useState(false);
   const [dlNumber20B, setDlNumber20B] = useState('');
   const [dlNumber21B, setDlNumber21B] = useState('');
   const [gstin, setGstin] = useState('');
@@ -63,29 +55,15 @@ export const WorkspaceOnboardingView: React.FC<WorkspaceOnboardingViewProps> = (
   const [contactEmail, setContactEmail] = useState(firebaseSession.email || '');
   const [invoicePrefix, setInvoicePrefix] = useState('INV');
   const [thermalPrinter, setThermalPrinter] = useState(true);
+  const createKeyRef = useRef<string>(generateIdempotencyKey('tenant_setup'));
 
-  // Join via Staff Invitation State
-  const [inviteTenantId, setInviteTenantId] = useState(initialInviteTenantId || '');
-  const [inviteToken, setInviteToken] = useState(initialInviteToken || '');
-
-  const suggestedSlug = useMemo(() => {
-    return name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 40);
-  }, [name]);
+  // Join via Joining Code State
+  const [joiningCode, setJoiningCode] = useState('');
+  const [codePreview, setCodePreview] = useState<JoiningCodePreview | null>(null);
 
   const handleNameChange = (value: string) => {
     setName(value);
-    if (!tenantIdEdited) {
-      const slug = value
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-+|-+$/g, '')
-        .slice(0, 40);
-      setTenantId(slug);
-    }
+    createKeyRef.current = generateIdempotencyKey('tenant_setup');
     if (invoicePrefix === 'INV' && value.trim().length >= 3) {
       const autoPrefix = value.replace(/[^a-zA-Z0-9]/g, '').slice(0, 3).toUpperCase();
       if (autoPrefix.length >= 2) {
@@ -111,13 +89,16 @@ export const WorkspaceOnboardingView: React.FC<WorkspaceOnboardingViewProps> = (
   const handleCheckVerification = async () => {
     setVerificationBusy(true);
     setError(null);
+    setNotice(null);
     try {
       const res = await reloadFirebaseUser();
-      await refreshMemberships();
+      await refreshMemberships(
+        res.idToken ? { bearerToken: res.idToken } : undefined
+      );
       if (res.emailVerified) {
-        setNotice('Email address verified.');
+        setNotice('Email address verified. You can now set up your pharmacy.');
       } else {
-        setNotice('Email is still pending verification. Please check your inbox/spam folder.');
+        setNotice('Email is still pending verification. Please check your inbox or spam folder.');
       }
     } catch (err: any) {
       setError(err?.message || 'Unable to refresh verification status.');
@@ -130,25 +111,28 @@ export const WorkspaceOnboardingView: React.FC<WorkspaceOnboardingViewProps> = (
     e.preventDefault();
     setError(null);
     setNotice(null);
-    const cleanTenantId = (tenantId || suggestedSlug).trim().toLowerCase();
-    if (!/^[a-z0-9-]{3,64}$/.test(cleanTenantId)) {
-      setError('Workspace ID must be 3–64 lowercase letters, numbers, or hyphens.');
+
+    if (!firebaseSession.emailVerified) {
+      setError('Please verify your email address before setting up your pharmacy.');
+      return;
+    }
+    if (!name.trim() || name.trim().length < 2) {
+      setError('Please enter your pharmacy name.');
       return;
     }
     if (!/^\d{6}$/.test(pincode.trim())) {
-      setError('Enter a valid 6-digit PIN code.');
+      setError('Please enter a valid 6-digit PIN code.');
       return;
     }
 
     setSubmitting(true);
     try {
-      await workspaceApi.createTenant(
+      const created = await workspaceApi.createTenant(
         {
           bearerToken: apiSession.bearerToken,
           appCheckToken: apiSession.appCheckToken,
         },
         {
-          tenantId: cleanTenantId,
           name: name.trim(),
           dlNumber20B: dlNumber20B.trim(),
           dlNumber21B: dlNumber21B.trim(),
@@ -161,43 +145,62 @@ export const WorkspaceOnboardingView: React.FC<WorkspaceOnboardingViewProps> = (
           contactEmail: contactEmail.trim(),
           invoicePrefix: invoicePrefix.trim().toUpperCase() || 'INV',
           thermalPrinter,
-        }
+        },
+        createKeyRef.current
       );
-      await refreshMemberships();
-      switchWorkspace(cleanTenantId);
+      const newTenantId = created.tenant.id;
+      await refreshMemberships({ preferredTenantId: newTenantId });
+      await switchWorkspace(newTenantId);
     } catch (err: any) {
-      setError(err?.detail || err?.message || 'Failed to create pharmacy workspace.');
+      setError(err?.detail || err?.message || 'Unable to create your pharmacy right now.');
     } finally {
       setSubmitting(false);
     }
   };
 
-  const handleAcceptInvitation = async (e: React.FormEvent) => {
+  const handleValidateCode = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     setNotice(null);
-    if (!inviteTenantId.trim() || !inviteToken.trim()) {
-      setError('Enter both Pharmacy Workspace ID and Invitation Token.');
+    const cleaned = joiningCode.trim().toUpperCase();
+    if (!cleaned) {
+      setError('Please enter the joining code provided by your pharmacy owner.');
       return;
     }
 
     setSubmitting(true);
     try {
-      const membership = await workspaceApi.acceptInvitation(
+      const preview = await workspaceApi.validateJoiningCode(cleaned);
+      setCodePreview(preview);
+    } catch (err: any) {
+      setCodePreview(null);
+      setError(err?.detail || err?.message || 'This joining code is incorrect.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleRedeemCode = async () => {
+    if (!codePreview) return;
+    setError(null);
+    setNotice(null);
+    if (!firebaseSession.emailVerified) {
+      setError('Please verify your email address first, then click Join Pharmacy.');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const membership = await workspaceApi.redeemJoiningCode(
         {
           bearerToken: apiSession.bearerToken,
           appCheckToken: apiSession.appCheckToken,
         },
-        {
-          tenantId: inviteTenantId.trim(),
-          token: inviteToken.trim(),
-        }
+        joiningCode.trim().toUpperCase()
       );
-      onClearPendingInvite?.();
-      await refreshMemberships();
-      switchWorkspace(membership.tenantId);
+      await refreshMemberships({ preferredTenantId: membership.tenantId });
+      await switchWorkspace(membership.tenantId);
     } catch (err: any) {
-      setError(err?.detail || err?.message || 'Invalid or expired staff invitation.');
+      setError(err?.detail || err?.message || 'Unable to join pharmacy with this code.');
     } finally {
       setSubmitting(false);
     }
@@ -207,14 +210,14 @@ export const WorkspaceOnboardingView: React.FC<WorkspaceOnboardingViewProps> = (
     <div className="min-h-screen bg-slate-50 py-8 px-4">
       <div className="max-w-2xl mx-auto space-y-4">
         {/* Header Bar */}
-        <div className="bg-white border border-slate-200 rounded-2xl px-6 py-4 flex flex-wrap items-center justify-between gap-3 shadow-xs">
+        <div className="bg-white border border-slate-200 rounded-2xl px-6 py-4 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-blue-600 text-white flex items-center justify-center font-bold">
               P+
             </div>
             <div>
               <h1 className="text-base font-bold text-slate-900">
-                Complete Pharmacy Workspace Setup
+                Set Up Your Pharmacy
               </h1>
               <p className="text-xs text-slate-500">
                 Signed in as <span className="font-medium text-slate-700">{firebaseSession.email}</span>
@@ -248,9 +251,9 @@ export const WorkspaceOnboardingView: React.FC<WorkspaceOnboardingViewProps> = (
             <div className="flex items-start gap-2.5 text-xs text-amber-900">
               <Mail className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
               <div>
-                <p className="font-bold">Verify your email address</p>
+                <p className="font-bold">Verify your email address to continue</p>
                 <p className="text-amber-800 mt-0.5">
-                  Check your inbox for the Firebase verification link so you can recover your account cleanly if needed.
+                  We sent a verification link to {firebaseSession.email}. Click the link in your inbox, then click Refresh.
                 </p>
               </div>
             </div>
@@ -270,7 +273,7 @@ export const WorkspaceOnboardingView: React.FC<WorkspaceOnboardingViewProps> = (
                 className="px-3 py-1.5 bg-amber-900 text-white hover:bg-amber-800 rounded-lg text-xs font-semibold inline-flex items-center gap-1"
               >
                 <RefreshCw className="w-3 h-3" />
-                <span>Refresh</span>
+                <span>I&apos;ve Verified</span>
               </button>
             </div>
           </div>
@@ -291,7 +294,7 @@ export const WorkspaceOnboardingView: React.FC<WorkspaceOnboardingViewProps> = (
         )}
 
         {/* Onboarding Card */}
-        <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">
+        <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
           <div className="grid grid-cols-2 border-b border-slate-200 bg-slate-50/70">
             <button
               type="button"
@@ -306,64 +309,43 @@ export const WorkspaceOnboardingView: React.FC<WorkspaceOnboardingViewProps> = (
               }`}
             >
               <Building2 className="w-4 h-4" />
-              <span>Create New Pharmacy Store</span>
+              <span>Set Up New Pharmacy</span>
             </button>
             <button
               type="button"
               onClick={() => {
                 setError(null);
-                setMode('invite');
+                setMode('join');
               }}
               className={`py-3.5 px-4 text-xs font-bold flex items-center justify-center gap-2 border-b-2 transition-colors ${
-                mode === 'invite'
+                mode === 'join'
                   ? 'border-blue-600 text-blue-700 bg-white'
                   : 'border-transparent text-slate-600 hover:text-slate-900'
               }`}
             >
               <KeyRound className="w-4 h-4" />
-              <span>Join Existing Pharmacy (Invite)</span>
+              <span>Join Existing Pharmacy</span>
             </button>
           </div>
 
           {mode === 'create' ? (
             <form onSubmit={handleCreatePharmacy} className="p-6 space-y-4">
-              <div className="p-3 bg-blue-50/70 border border-blue-200 rounded-xl text-xs text-blue-900 flex items-start gap-2">
-                <ShieldCheck className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
-                <span>
-                  Provisioning creates your isolated Cloud Firestore tenant, default <strong>Main Store</strong> branch, and Owner permissions.
-                </span>
-              </div>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Enter your medical store details below to set up billing, medicine stock, and your main store counter.
+              </p>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Pharmacy Name *
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={name}
-                    onChange={(e) => handleNameChange(e.target.value)}
-                    placeholder="e.g. Shree Sai Medical & General"
-                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Workspace ID (URL Slug) *
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={tenantId}
-                    onChange={(e) => {
-                      setTenantIdEdited(true);
-                      setTenantId(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''));
-                    }}
-                    placeholder="shree-sai-medical"
-                    className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600"
-                  />
-                </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Pharmacy Name *
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={name}
+                  onChange={(e) => handleNameChange(e.target.value)}
+                  placeholder="e.g. Shree Sai Medical & General"
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600"
+                />
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -489,7 +471,7 @@ export const WorkspaceOnboardingView: React.FC<WorkspaceOnboardingViewProps> = (
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Invoice Prefix
+                    Bill Prefix
                   </label>
                   <input
                     type="text"
@@ -509,60 +491,108 @@ export const WorkspaceOnboardingView: React.FC<WorkspaceOnboardingViewProps> = (
                     onChange={(e) => setThermalPrinter(e.target.checked)}
                     className="rounded border-slate-300 text-blue-600"
                   />
-                  <span>Use 80mm Thermal POS Receipt layout by default (uncheck for A4/A5 Tax Invoice)</span>
+                  <span>Use 80mm Thermal Receipt format by default (uncheck for A4/A5 Tax Invoice)</span>
                 </label>
               </div>
 
               <button
                 type="submit"
-                disabled={submitting}
-                className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl shadow-xs disabled:opacity-60"
+                disabled={submitting || !firebaseSession.emailVerified}
+                className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl shadow-xs disabled:opacity-50"
               >
-                {submitting ? 'Creating Pharmacy Workspace...' : 'Create Pharmacy Workspace & Start Billing'}
+                {submitting
+                  ? 'Setting Up Your Pharmacy...'
+                  : 'Create Pharmacy & Start Billing'}
               </button>
             </form>
           ) : (
-            <form onSubmit={handleAcceptInvitation} className="p-6 space-y-4">
+            <div className="p-6 space-y-4">
               <p className="text-xs text-slate-600 leading-relaxed">
-                Ask your pharmacy owner to share your staff invitation link or paste your Pharmacy Workspace ID and Invitation Token below. You must be signed in with the invited email ({firebaseSession.email}).
+                Enter the joining code shared by your pharmacy owner. You must be signed in with the invited email address ({firebaseSession.email}).
               </p>
 
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Pharmacy Workspace ID *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={inviteTenantId}
-                  onChange={(e) => setInviteTenantId(e.target.value.trim())}
-                  placeholder="e.g. shree-sai-medical"
-                  className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600"
-                />
-              </div>
+              {!codePreview ? (
+                <form onSubmit={handleValidateCode} className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Employee Joining Code *
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={joiningCode}
+                      onChange={(e) => setJoiningCode(e.target.value.toUpperCase())}
+                      placeholder="PDK-XXXX-XXXX"
+                      className="w-full px-3 py-2.5 text-sm font-mono uppercase tracking-wider border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600"
+                    />
+                  </div>
 
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Invitation Token *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={inviteToken}
-                  onChange={(e) => setInviteToken(e.target.value.trim())}
-                  placeholder="Paste 64-character token from invitation link"
-                  className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600"
-                />
-              </div>
+                  <button
+                    type="submit"
+                    disabled={submitting}
+                    className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl shadow-xs disabled:opacity-60"
+                  >
+                    {submitting ? 'Checking Code...' : 'Continue'}
+                  </button>
+                </form>
+              ) : (
+                <div className="space-y-4">
+                  <div className="p-4 rounded-xl border border-slate-200 bg-slate-50 space-y-2 text-xs">
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Pharmacy</span>
+                      <span className="font-bold text-slate-900">{codePreview.pharmacyName}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Assigned Role</span>
+                      <span className="font-semibold text-slate-900">{codePreview.assignedRoleLabel}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Assigned Branch</span>
+                      <span className="font-medium text-slate-900">
+                        {codePreview.assignedBranches.map((b) => b.name).join(', ')}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Invited Email</span>
+                      <span className="font-mono text-slate-700">{codePreview.maskedEmail}</span>
+                    </div>
+                  </div>
 
-              <button
-                type="submit"
-                disabled={submitting}
-                className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl shadow-xs disabled:opacity-60"
-              >
-                {submitting ? 'Activating Membership...' : 'Accept Staff Invitation'}
-              </button>
-            </form>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCodePreview(null);
+                        setError(null);
+                      }}
+                      className="px-4 py-2.5 text-xs font-semibold text-slate-600 border border-slate-200 rounded-xl hover:bg-slate-50"
+                    >
+                      Change Code
+                    </button>
+                    <button
+                      type="button"
+                      disabled={submitting || !firebaseSession.emailVerified}
+                      onClick={handleRedeemCode}
+                      className="flex-1 py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl shadow-xs disabled:opacity-50"
+                    >
+                      {submitting ? 'Joining Pharmacy...' : `Join ${codePreview.pharmacyName}`}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {onOpenJoinPharmacy && (
+                <div className="pt-2 border-t border-slate-100 text-center">
+                  <button
+                    type="button"
+                    onClick={onOpenJoinPharmacy}
+                    className="text-xs font-medium text-blue-600 hover:text-blue-700"
+                  >
+                    Open full Join Pharmacy page
+                  </button>
+                </div>
+              )}
+            </div>
           )}
         </div>
       </div>

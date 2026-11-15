@@ -75,6 +75,7 @@ const envSchema = z.object({
   FIRESTORE_EMULATOR_HOST: z.string().optional(),
   FIREBASE_AUTH_EMULATOR_HOST: z.string().optional(),
   FIREBASE_STORAGE_EMULATOR_HOST: z.string().optional(),
+  JOINING_CODE_HASH_PEPPER: z.string().trim().optional(),
   // Phase 11: Security Hardening, Retention & Disaster Recovery Configuration
   TRUST_PROXY: z
     .string()

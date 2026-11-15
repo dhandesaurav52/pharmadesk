@@ -28,6 +28,9 @@ export interface AuditLogQueryFilters {
 
 const SENSITIVE_EXACT_KEYS = new Set([
   'token',
+  'joiningcode',
+  'joiningcodehash',
+  'tokenhash',
   'privatekey',
   'apikey',
   'secret',
@@ -65,6 +68,7 @@ export function maskAuditMetadata(
     if (
       SENSITIVE_EXACT_KEYS.has(lower) ||
       lower.includes('token') ||
+      lower.includes('joiningcode') ||
       lower.includes('secret') ||
       lower.includes('password') ||
       lower.includes('privatekey')

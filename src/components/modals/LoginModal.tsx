@@ -8,17 +8,17 @@ import {
   X,
   Lock,
   Mail,
-  ShieldCheck,
   CheckCircle2,
   AlertCircle,
   LogOut,
   KeyRound,
   UserPlus,
   User as UserIcon,
+  Building2,
 } from 'lucide-react';
 import { usePharmacy } from '../../context/PharmacyContext.tsx';
-import { UserRole } from '../../types/pharmacy.ts';
 import {
+  reloadFirebaseUser,
   requestPasswordReset,
   resendVerificationEmail,
   signInWithEmail,
@@ -27,16 +27,18 @@ import {
 
 interface LoginModalProps {
   onEnterWorkspace?: () => void;
+  onJoinPharmacy?: () => void;
 }
 
-export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
+export const LoginModal: React.FC<LoginModalProps> = ({
+  onEnterWorkspace,
+  onJoinPharmacy,
+}) => {
   const {
     isLoginModalOpen,
     setIsLoginModalOpen,
-    currentUser,
-    switchUserRole,
-    usersList,
     firebaseSession,
+    refreshMemberships,
     signOutSession,
   } = usePharmacy();
 
@@ -51,43 +53,49 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
 
   if (!isLoginModalOpen) return null;
 
-  const isProdBuild = import.meta.env.PROD;
-  const showDevRolePreview = !isProdBuild && !firebaseSession.authenticated;
-
-  const handleFirebaseSignIn = async (e: React.FormEvent) => {
+  const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
     setLoginNotification(null);
     setIsSubmitting(true);
     try {
-      const { user } = await signInWithEmail(email, password);
-      setLoginNotification(`Signed in as ${user.email || user.uid}`);
+      const { user, idToken, appCheckToken } = await signInWithEmail(email, password);
+      await refreshMemberships({ bearerToken: idToken, appCheckToken });
+      setLoginNotification(`Signed in as ${user.email || 'your account'}`);
       setPassword('');
       setTimeout(() => {
         setLoginNotification(null);
         setIsLoginModalOpen(false);
         onEnterWorkspace?.();
-      }, 600);
+      }, 400);
     } catch (err: any) {
       const code = err?.code || '';
-      if (code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found') {
-        setAuthError('Invalid email or password.');
+      if (
+        code === 'auth/invalid-credential' ||
+        code === 'auth/wrong-password' ||
+        code === 'auth/user-not-found'
+      ) {
+        setAuthError('Incorrect email or password.');
       } else if (code === 'auth/user-disabled') {
-        setAuthError('This Firebase account has been disabled. Contact your store owner.');
+        setAuthError('This account has been disabled. Contact your pharmacy owner.');
       } else if (code === 'auth/too-many-requests') {
-        setAuthError('Too many failed attempts. Please wait before retrying or reset your password.');
+        setAuthError('Too many failed attempts. Please wait a few minutes or reset your password.');
       } else {
-        setAuthError(err?.message || 'Unable to sign in with Firebase Authentication.');
+        setAuthError(err?.message || 'Unable to sign in right now. Please try again.');
       }
     } finally {
       setIsSubmitting(false);
     }
   };
 
-  const handleFirebaseSignUp = async (e: React.FormEvent) => {
+  const handleSignUp = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
     setLoginNotification(null);
+    if (!fullName.trim()) {
+      setAuthError('Please enter your full name.');
+      return;
+    }
     if (password.length < 6) {
       setAuthError('Password must be at least 6 characters long.');
       return;
@@ -98,13 +106,14 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
     }
     setIsSubmitting(true);
     try {
-      const { user } = await signUpWithEmail({
+      const { user, idToken, appCheckToken } = await signUpWithEmail({
         email,
         password,
         displayName: fullName,
       });
+      await refreshMemberships({ bearerToken: idToken, appCheckToken });
       setLoginNotification(
-        `Account created for ${user.email}. Check your email to verify, then complete pharmacy setup.`
+        `Account created for ${user.email}. Check your email to verify, then set up your pharmacy.`
       );
       setPassword('');
       setConfirmPassword('');
@@ -112,15 +121,15 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
         setLoginNotification(null);
         setIsLoginModalOpen(false);
         onEnterWorkspace?.();
-      }, 900);
+      }, 700);
     } catch (err: any) {
       const code = err?.code || '';
       if (code === 'auth/email-already-in-use') {
-        setAuthError('An account with this email already exists. Switch to Sign In instead.');
+        setAuthError('An account with this email already exists. Please sign in instead.');
       } else if (code === 'auth/weak-password') {
-        setAuthError('Choose a stronger password (at least 6 characters).');
+        setAuthError('Please choose a stronger password (at least 6 characters).');
       } else {
-        setAuthError(err?.message || 'Unable to create Firebase account.');
+        setAuthError(err?.message || 'Unable to create your account right now.');
       }
     } finally {
       setIsSubmitting(false);
@@ -156,28 +165,37 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
     }
   };
 
-  const handleSignOut = async () => {
+  const handleRefreshVerification = async () => {
     setAuthError(null);
     setIsSubmitting(true);
     try {
-      await signOutSession();
-      setLoginNotification('Signed out and backend refresh token revoked.');
+      const res = await reloadFirebaseUser();
+      if (res.idToken) {
+        await refreshMemberships({ bearerToken: res.idToken });
+      }
+      if (res.emailVerified) {
+        setLoginNotification('Your email address is verified.');
+      } else {
+        setAuthError('Verification is still pending. Please click the link sent to your email.');
+      }
     } catch (err: any) {
-      setAuthError(err?.message || 'Unable to sign out cleanly.');
+      setAuthError(err?.message || 'Unable to check verification status.');
     } finally {
       setIsSubmitting(false);
     }
   };
 
-  const handleQuickLogin = (role: UserRole) => {
-    switchUserRole(role);
-    const target = usersList.find(u => u.role === role);
-    setLoginNotification(`Preview profile switched to ${target?.name} (${role.toUpperCase()})`);
-    setTimeout(() => {
-      setLoginNotification(null);
-      setIsLoginModalOpen(false);
-      onEnterWorkspace?.();
-    }, 600);
+  const handleSignOut = async () => {
+    setAuthError(null);
+    setIsSubmitting(true);
+    try {
+      await signOutSession();
+      setLoginNotification('You have been signed out.');
+    } catch (err: any) {
+      setAuthError(err?.message || 'Unable to sign out right now.');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -190,14 +208,28 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
               P+
             </div>
             <div>
-              <h3 className="text-sm font-bold text-slate-900">PharmaDesk Account</h3>
-              <p className="text-[11px] text-slate-500">Firebase Auth &amp; Live Firestore RBAC</p>
+              <h3 className="text-sm font-bold text-slate-900">
+                {firebaseSession.authenticated
+                  ? 'My PharmaDesk Account'
+                  : viewMode === 'signup'
+                  ? 'Create Pharmacy Account'
+                  : viewMode === 'reset'
+                  ? 'Reset Your Password'
+                  : 'Welcome Back'}
+              </h3>
+              <p className="text-[11px] text-slate-500">
+                {firebaseSession.authenticated
+                  ? firebaseSession.email || 'Signed in'
+                  : 'Sign in to your PharmaDesk pharmacy'}
+              </p>
             </div>
           </div>
 
           <button
+            type="button"
             onClick={() => setIsLoginModalOpen(false)}
             className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-200"
+            aria-label="Close account modal"
           >
             <X className="w-4 h-4" />
           </button>
@@ -217,41 +249,47 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
           </div>
         )}
 
-        <div className="p-6 space-y-5">
-          {/* Architecture notice */}
-          <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl">
-            <div className="flex items-start gap-2">
-              <ShieldCheck className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
-              <div className="text-[11px] text-slate-600 leading-relaxed">
-                <span className="font-semibold text-slate-800">Firebase Auth &amp; App Check:</span>{' '}
-                {firebaseSession.configured
-                  ? `Connected to Firebase project. App Check attestation: ${
-                      firebaseSession.appCheckConfigured ? 'Configured' : 'Optional / Dev'
-                    }.`
-                  : 'Set VITE_FIREBASE_* environment variables to sign in against your Firebase project.'}
-              </div>
-            </div>
-          </div>
-
+        <div className="p-6 space-y-4">
           {firebaseSession.authenticated ? (
-            <div className="p-4 rounded-xl border border-emerald-200 bg-emerald-50/50 space-y-3">
-              <div className="text-xs text-slate-800">
-                <span className="font-semibold block">Signed in via Firebase Authentication</span>
-                <span className="text-slate-600 block mt-0.5">{firebaseSession.email || firebaseSession.uid}</span>
-                <span className="text-[11px] text-slate-500 block mt-0.5">
-                  Email verified: {firebaseSession.emailVerified ? 'Yes' : 'Pending'}
-                </span>
+            <div className="space-y-3">
+              <div className="p-4 rounded-xl border border-slate-200 bg-slate-50 space-y-1.5 text-xs">
+                <div className="font-semibold text-slate-900">Signed in account</div>
+                <div className="text-slate-700">{firebaseSession.email}</div>
+                <div className="text-[11px] text-slate-500">
+                  Email status:{' '}
+                  <span
+                    className={
+                      firebaseSession.emailVerified
+                        ? 'text-emerald-700 font-semibold'
+                        : 'text-amber-700 font-semibold'
+                    }
+                  >
+                    {firebaseSession.emailVerified ? 'Verified' : 'Verification pending'}
+                  </span>
+                </div>
               </div>
+
               {!firebaseSession.emailVerified && (
-                <button
-                  type="button"
-                  disabled={isSubmitting}
-                  onClick={handleResendVerification}
-                  className="w-full py-2 px-3 rounded-lg bg-amber-50 border border-amber-200 hover:bg-amber-100 text-amber-900 text-xs font-semibold"
-                >
-                  Resend Verification Email
-                </button>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    disabled={isSubmitting}
+                    onClick={handleResendVerification}
+                    className="py-2 px-3 rounded-lg bg-amber-50 border border-amber-200 hover:bg-amber-100 text-amber-900 text-xs font-semibold"
+                  >
+                    Resend Email
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isSubmitting}
+                    onClick={handleRefreshVerification}
+                    className="py-2 px-3 rounded-lg bg-amber-900 hover:bg-amber-800 text-white text-xs font-semibold"
+                  >
+                    I Have Verified
+                  </button>
+                </div>
               )}
+
               {onEnterWorkspace && (
                 <button
                   type="button"
@@ -259,11 +297,26 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                     setIsLoginModalOpen(false);
                     onEnterWorkspace();
                   }}
-                  className="w-full py-2 px-3 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold"
+                  className="w-full py-2.5 px-4 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold"
                 >
                   Open Pharmacy Workspace
                 </button>
               )}
+
+              {onJoinPharmacy && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsLoginModalOpen(false);
+                    onJoinPharmacy();
+                  }}
+                  className="w-full py-2 px-4 rounded-lg border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-semibold inline-flex items-center justify-center gap-1.5"
+                >
+                  <Building2 className="w-3.5 h-3.5 text-slate-500" />
+                  <span>Join Another Pharmacy with Code</span>
+                </button>
+              )}
+
               <button
                 type="button"
                 disabled={isSubmitting}
@@ -271,7 +324,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                 className="w-full py-2 px-3 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold flex items-center justify-center gap-2 disabled:opacity-60"
               >
                 <LogOut className="w-3.5 h-3.5" />
-                <span>Sign Out &amp; Revoke Session</span>
+                <span>Sign Out</span>
               </button>
             </div>
           ) : firebaseSession.configured ? (
@@ -282,6 +335,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                     type="button"
                     onClick={() => {
                       setAuthError(null);
+                      setLoginNotification(null);
                       setViewMode('signin');
                     }}
                     className={`py-1.5 rounded-md transition-colors ${
@@ -296,6 +350,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                     type="button"
                     onClick={() => {
                       setAuthError(null);
+                      setLoginNotification(null);
                       setViewMode('signup');
                     }}
                     className={`py-1.5 rounded-md transition-colors ${
@@ -304,15 +359,17 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                         : 'text-slate-600 hover:text-slate-900'
                     }`}
                   >
-                    Create Account
+                    Create Pharmacy Account
                   </button>
                 </div>
               )}
 
               {viewMode === 'signin' ? (
-                <form onSubmit={handleFirebaseSignIn} className="space-y-3">
+                <form onSubmit={handleSignIn} className="space-y-3">
                   <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">Staff / Owner Email</label>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Email Address
+                    </label>
                     <div className="relative">
                       <Mail className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
                       <input
@@ -320,14 +377,16 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                         required
                         autoComplete="email"
                         value={email}
-                        onChange={e => setEmail(e.target.value)}
-                        placeholder="pharmacist@yourpharmacy.in"
+                        onChange={(e) => setEmail(e.target.value)}
+                        placeholder="you@yourpharmacy.in"
                         className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                       />
                     </div>
                   </div>
                   <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">Password</label>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Password
+                    </label>
                     <div className="relative">
                       <Lock className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
                       <input
@@ -335,7 +394,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                         required
                         autoComplete="current-password"
                         value={password}
-                        onChange={e => setPassword(e.target.value)}
+                        onChange={(e) => setPassword(e.target.value)}
                         placeholder="Enter your password"
                         className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                       />
@@ -346,9 +405,9 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                     disabled={isSubmitting}
                     className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg shadow-xs disabled:opacity-60"
                   >
-                    {isSubmitting ? 'Signing In...' : 'Sign In with Firebase'}
+                    {isSubmitting ? 'Signing In...' : 'Sign In'}
                   </button>
-                  <div className="text-right">
+                  <div className="flex items-center justify-between pt-1">
                     <button
                       type="button"
                       onClick={() => {
@@ -357,28 +416,35 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                       }}
                       className="text-[11px] font-medium text-blue-600 hover:text-blue-700"
                     >
-                      Forgot password? Reset via email
+                      Forgot Password?
                     </button>
                   </div>
                 </form>
               ) : viewMode === 'signup' ? (
-                <form onSubmit={handleFirebaseSignUp} className="space-y-3">
+                <form onSubmit={handleSignUp} className="space-y-3">
+                  <p className="text-[11px] text-slate-600 leading-relaxed">
+                    For pharmacy owners setting up a new store. Joining an existing store? Use your joining code below.
+                  </p>
                   <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">Your Full Name *</label>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Your Full Name *
+                    </label>
                     <div className="relative">
                       <UserIcon className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
                       <input
                         type="text"
                         required
                         value={fullName}
-                        onChange={e => setFullName(e.target.value)}
+                        onChange={(e) => setFullName(e.target.value)}
                         placeholder="e.g. Rajesh Deshmukh"
                         className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                       />
                     </div>
                   </div>
                   <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">Work Email *</label>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Email Address *
+                    </label>
                     <div className="relative">
                       <Mail className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
                       <input
@@ -386,7 +452,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                         required
                         autoComplete="email"
                         value={email}
-                        onChange={e => setEmail(e.target.value)}
+                        onChange={(e) => setEmail(e.target.value)}
                         placeholder="owner@yourpharmacy.in"
                         className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                       />
@@ -394,27 +460,31 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                   </div>
                   <div className="grid grid-cols-2 gap-2.5">
                     <div>
-                      <label className="block text-xs font-semibold text-slate-700 mb-1">Password *</label>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">
+                        Password *
+                      </label>
                       <input
                         type="password"
                         required
                         minLength={6}
                         autoComplete="new-password"
                         value={password}
-                        onChange={e => setPassword(e.target.value)}
+                        onChange={(e) => setPassword(e.target.value)}
                         placeholder="Min 6 chars"
                         className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                       />
                     </div>
                     <div>
-                      <label className="block text-xs font-semibold text-slate-700 mb-1">Confirm *</label>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">
+                        Confirm Password *
+                      </label>
                       <input
                         type="password"
                         required
                         minLength={6}
                         autoComplete="new-password"
                         value={confirmPassword}
-                        onChange={e => setConfirmPassword(e.target.value)}
+                        onChange={(e) => setConfirmPassword(e.target.value)}
                         placeholder="Re-enter"
                         className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                       />
@@ -426,13 +496,15 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                     className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg shadow-xs disabled:opacity-60 inline-flex items-center justify-center gap-1.5"
                   >
                     <UserPlus className="w-3.5 h-3.5" />
-                    <span>{isSubmitting ? 'Creating Account...' : 'Create Account & Continue'}</span>
+                    <span>{isSubmitting ? 'Creating Account...' : 'Create Pharmacy Account'}</span>
                   </button>
                 </form>
               ) : (
                 <form onSubmit={handlePasswordReset} className="space-y-3">
                   <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">Registered Staff Email</label>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Registered Email Address
+                    </label>
                     <div className="relative">
                       <KeyRound className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
                       <input
@@ -440,8 +512,8 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                         required
                         autoComplete="email"
                         value={email}
-                        onChange={e => setEmail(e.target.value)}
-                        placeholder="pharmacist@yourpharmacy.in"
+                        onChange={(e) => setEmail(e.target.value)}
+                        placeholder="you@yourpharmacy.in"
                         className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
                       />
                     </div>
@@ -451,7 +523,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                     disabled={isSubmitting}
                     className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg shadow-xs disabled:opacity-60"
                   >
-                    {isSubmitting ? 'Sending Reset Email...' : 'Send Password Reset Link'}
+                    {isSubmitting ? 'Sending Reset Link...' : 'Send Password Reset Link'}
                   </button>
                   <div className="text-right">
                     <button
@@ -467,56 +539,26 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                   </div>
                 </form>
               )}
-            </div>
-          ) : isProdBuild ? (
-            <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800">
-              Firebase Web SDK configuration (`VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_PROJECT_ID`, `VITE_FIREBASE_APP_ID`) is required in production builds.
-            </div>
-          ) : null}
 
-          {/* Development-Only UI Permission Preview */}
-          {showDevRolePreview && (
-            <div className="space-y-2 pt-3 border-t border-slate-200">
-              <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider">
-                Local Dev Role Preview Profiles
-              </label>
-
-              {usersList.map(user => {
-                const isActive = currentUser.role === user.role;
-                return (
+              {onJoinPharmacy && (
+                <div className="pt-3 border-t border-slate-200">
                   <button
-                    key={user.id}
-                    onClick={() => handleQuickLogin(user.role)}
-                    className={`w-full p-2.5 rounded-xl border text-left flex items-center justify-between transition-all ${
-                      isActive
-                        ? 'border-blue-600 bg-blue-50/60 ring-1 ring-blue-600/30'
-                        : 'border-slate-200 hover:border-slate-300 hover:bg-slate-50'
-                    }`}
+                    type="button"
+                    onClick={() => {
+                      setIsLoginModalOpen(false);
+                      onJoinPharmacy();
+                    }}
+                    className="w-full py-2.5 px-4 rounded-lg border border-slate-300 bg-slate-50 hover:bg-slate-100 text-slate-800 text-xs font-semibold inline-flex items-center justify-center gap-2 transition-colors"
                   >
-                    <div className="flex items-center gap-3">
-                      <div className="w-7 h-7 rounded-full bg-slate-900 text-white flex items-center justify-center font-bold text-xs">
-                        {user.name.charAt(0)}
-                      </div>
-                      <div>
-                        <span className="text-xs font-bold text-slate-900 block">
-                          {user.name}
-                        </span>
-                        <span className="text-[11px] text-slate-500 block capitalize">
-                          Role: {user.role === 'owner' ? 'Store Owner' : user.role} • {user.email}
-                        </span>
-                      </div>
-                    </div>
-
-                    {isActive ? (
-                      <span className="text-[11px] font-semibold text-blue-700 bg-blue-100 px-2 py-0.5 rounded">
-                        Active
-                      </span>
-                    ) : (
-                      <span className="text-xs text-slate-400">Preview →</span>
-                    )}
+                    <Building2 className="w-3.5 h-3.5 text-blue-600" />
+                    <span>Join Existing Pharmacy</span>
                   </button>
-                );
-              })}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900">
+              Sign-in service is currently unavailable. Please contact support for assistance.
             </div>
           )}
         </div>

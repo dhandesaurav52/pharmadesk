@@ -5,6 +5,7 @@ import { adminAuth, firestore } from '../lib/firebaseAdmin';
 import { logger } from '../lib/logger';
 import { AuditService } from '../services/auditService';
 import { getAllTestMembershipsForUser } from '../middleware/tenantAuthorization';
+import { getTestTenant } from '../services/tenantService';
 
 export const authRouter = Router();
 
@@ -13,7 +14,8 @@ authRouter.use(firebaseAuthMiddleware);
 
 /**
  * GET /api/v1/auth/me
- * Returns the currently authenticated user's profile and active pharmacy tenant memberships.
+ * Returns the currently authenticated user's profile, active pharmacy memberships,
+ * and paused/inactive membership summaries so the client can show appropriate status messages.
  */
 authRouter.get(
   '/me',
@@ -21,24 +23,73 @@ authRouter.get(
     const user = req.user!;
     const isTestEnv = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
 
-    // Query memberships for this user across collection group 'memberships'
     const memberships: any[] = [];
+    const inactiveMemberships: Array<{
+      tenantId: string;
+      tenantName?: string;
+      role: string;
+      status: string;
+    }> = [];
+
     if (isTestEnv) {
-      memberships.push(
-        ...getAllTestMembershipsForUser(user.uid).filter((m) => m.status === 'active')
-      );
+      const all = getAllTestMembershipsForUser(user.uid);
+      for (const m of all) {
+        const tenant = getTestTenant(m.tenantId);
+        if (m.status === 'active') {
+          memberships.push({
+            ...m,
+            tenantName: (m as any).tenantName || tenant?.name || undefined,
+          });
+        } else {
+          inactiveMemberships.push({
+            tenantId: m.tenantId,
+            tenantName: (m as any).tenantName || tenant?.name || undefined,
+            role: m.role,
+            status: m.status,
+          });
+        }
+      }
     } else {
       const db = firestore();
       try {
         const snap = await db
           .collectionGroup('memberships')
           .where('userId', '==', user.uid)
-          .where('status', '==', 'active')
           .get();
 
-        snap.forEach((doc) => {
-          memberships.push(doc.data());
-        });
+        const rawDocs = snap.docs.map((doc) => doc.data() as any);
+        const tenantIds = Array.from(new Set(rawDocs.map((d) => String(d.tenantId || '')).filter(Boolean)));
+        const tenantNames = new Map<string, string>();
+        await Promise.all(
+          tenantIds.map(async (tId) => {
+            try {
+              const tSnap = await db.collection('tenants').doc(tId).get();
+              if (tSnap.exists) {
+                const tData = tSnap.data() as { name?: string; status?: string } | undefined;
+                if (tData?.name) tenantNames.set(tId, tData.name);
+              }
+            } catch {
+              // Best-effort tenant name lookup
+            }
+          })
+        );
+
+        for (const m of rawDocs) {
+          const tenantName = m.tenantName || tenantNames.get(m.tenantId);
+          if (m.status === 'active') {
+            memberships.push({
+              ...m,
+              ...(tenantName ? { tenantName } : {}),
+            });
+          } else if (m.status === 'suspended' || m.status === 'deactivated') {
+            inactiveMemberships.push({
+              tenantId: m.tenantId,
+              tenantName,
+              role: m.role,
+              status: m.status,
+            });
+          }
+        }
       } catch (err: any) {
         logger.warn(
           { requestId: req.id, uid: user.uid, err: err?.message },
@@ -53,6 +104,7 @@ authRouter.get(
       emailVerified: user.emailVerified ?? false,
       phoneNumber: user.phoneNumber || null,
       memberships,
+      inactiveMemberships,
     });
   })
 );

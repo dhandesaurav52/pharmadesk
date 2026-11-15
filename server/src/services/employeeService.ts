@@ -1,10 +1,12 @@
 import crypto from 'node:crypto';
 import { adminAuth, firestore } from '../lib/firebaseAdmin';
+import { env } from '../config/env';
 import {
   BadRequestError,
   NotFoundError,
   ConflictError,
   ForbiddenError,
+  RateLimitError,
 } from '../lib/errors';
 import { UserRole } from '../types/express';
 import { logger } from '../lib/logger';
@@ -15,6 +17,7 @@ import {
   hasRegisteredTestBranches,
 } from '../middleware/tenantAuthorization';
 import { BranchService } from './branchService';
+import { getTestTenant } from './tenantService';
 import {
   resolveEffectivePermissions,
   validatePermissionOverrides,
@@ -31,6 +34,14 @@ export interface CreateInvitationInput {
   permissionOverrides?: PermissionOverrides;
 }
 
+export type StaffDisplayStatus =
+  | 'Invitation Ready'
+  | 'Awaiting Account Setup'
+  | 'Active'
+  | 'Suspended'
+  | 'Invitation Expired'
+  | 'Invitation Revoked';
+
 export interface InvitationRecord {
   id: string;
   tenantId: string;
@@ -40,37 +51,201 @@ export interface InvitationRecord {
   role: UserRole;
   assignedBranchIds: string[];
   permissionOverrides?: PermissionOverrides;
-  token: string;
+  // Cryptographic HMAC-SHA256 digests only — raw codes/tokens are never persisted
+  tokenHash?: string;
+  tokenLast6?: string;
+  joiningCodeHash?: string;
+  codeLast4?: string;
+  // Returned only one-time during create/regenerate/resend, or masked on list
+  token?: string;
+  joiningCode?: string;
+  joiningCodeMasked?: string;
+  displayStatus?: StaffDisplayStatus;
   status: 'pending' | 'accepted' | 'expired' | 'cancelled' | 'revoked';
   expiresAt: string;
   createdAt: string;
   createdBy: string;
+  updatedAt?: string;
   acceptedByUserId?: string;
   acceptedAt?: string;
+  revokedAt?: string;
+  revokedBy?: string;
 }
 
-// In-memory store for unit test execution
+export interface JoiningCodeLookupRecord {
+  codeHash: string;
+  tenantId: string;
+  invitationId: string;
+  status: 'pending' | 'accepted' | 'expired' | 'cancelled' | 'revoked';
+  expiresAt: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface ValidatedJoiningCodePreview {
+  valid: true;
+  pharmacyName: string;
+  assignedRole: UserRole;
+  assignedRoleLabel: string;
+  assignedBranches: Array<{ id: string; name: string }>;
+  maskedEmail: string;
+  expiresAt: string;
+}
+
+const JOINING_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+
+const ROLE_LABELS: Record<UserRole, string> = {
+  owner: 'Owner',
+  pharmacist: 'Pharmacist',
+  cashier: 'Cashier',
+  helper: 'Store Helper',
+  auditor: 'Auditor',
+};
+
+// In-memory stores for unit test execution
 const testInvitations = new Map<string, InvitationRecord>();
+const testJoiningCodeLookup = new Map<string, JoiningCodeLookupRecord>();
+const activeRedemptionLocks = new Set<string>();
+const failedCodeAttempts = new Map<string, { count: number; resetAt: number }>();
+
+const FAILED_CODE_WINDOW_MS = 15 * 60 * 1000;
+const MAX_FAILED_CODE_ATTEMPTS = 8;
+
+function getJoiningCodePepper(): string {
+  return (
+    env.JOINING_CODE_HASH_PEPPER ||
+    env.FIREBASE_PROJECT_ID ||
+    'pharmadesk-joining-code-pepper'
+  );
+}
+
+export function hashSecretValue(raw: string): string {
+  return crypto.createHmac('sha256', getJoiningCodePepper()).update(raw).digest('hex');
+}
+
+export function normalizeJoiningCode(input: string): string {
+  const cleaned = input.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (cleaned.startsWith('PDK') && cleaned.length === 11) {
+    const body = cleaned.slice(3);
+    return `PDK-${body.slice(0, 4)}-${body.slice(4, 8)}`;
+  }
+  if (cleaned.length === 8) {
+    return `PDK-${cleaned.slice(0, 4)}-${cleaned.slice(4, 8)}`;
+  }
+  return input.trim().toUpperCase();
+}
+
+export function maskEmail(email: string): string {
+  const trimmed = email.trim().toLowerCase();
+  const atIndex = trimmed.indexOf('@');
+  if (atIndex <= 0) return '***';
+  const local = trimmed.slice(0, atIndex);
+  const domain = trimmed.slice(atIndex + 1);
+  const prefix = local.length >= 3 ? local.slice(0, 2) : local.slice(0, 1);
+  return `${prefix}***@${domain}`;
+}
 
 export function setTestInvitation(invitation: InvitationRecord) {
-  testInvitations.set(`${invitation.tenantId}:${invitation.token}`, invitation);
-  testInvitations.set(`${invitation.tenantId}:${invitation.id}`, invitation);
+  const persisted: InvitationRecord = { ...invitation };
+  const rawToken = persisted.token;
+  const rawCode = persisted.joiningCode;
+
+  if (rawToken && !persisted.tokenHash) {
+    persisted.tokenHash = hashSecretValue(rawToken);
+    persisted.tokenLast6 = rawToken.slice(-6);
+  }
+  if (rawCode && !persisted.joiningCodeHash) {
+    const normalized = normalizeJoiningCode(rawCode);
+    persisted.joiningCodeHash = hashSecretValue(normalized);
+    persisted.codeLast4 = normalized.slice(-4);
+  }
+
+  // Never persist raw token or raw joining code in stored record
+  delete persisted.token;
+  delete persisted.joiningCode;
+
+  testInvitations.set(`${persisted.tenantId}:${persisted.id}`, persisted);
+  if (persisted.tokenHash) {
+    testInvitations.set(`${persisted.tenantId}:hash:${persisted.tokenHash}`, persisted);
+  }
+  if (persisted.joiningCodeHash) {
+    testJoiningCodeLookup.set(persisted.joiningCodeHash, {
+      codeHash: persisted.joiningCodeHash,
+      tenantId: persisted.tenantId,
+      invitationId: persisted.id,
+      status: persisted.status,
+      expiresAt: persisted.expiresAt,
+      createdAt: persisted.createdAt,
+      updatedAt: persisted.updatedAt,
+    });
+  }
+}
+
+export function getRawStoredTestInvitations(tenantId: string): InvitationRecord[] {
+  const result: InvitationRecord[] = [];
+  for (const [key, value] of testInvitations.entries()) {
+    if (key.startsWith(`${tenantId}:`) && key === `${tenantId}:${value.id}`) {
+      result.push({ ...value });
+    }
+  }
+  return result;
 }
 
 export function clearTestInvitations() {
   testInvitations.clear();
+  testJoiningCodeLookup.clear();
+  activeRedemptionLocks.clear();
+  failedCodeAttempts.clear();
+}
+
+function recordFailedCodeAttempt(clientKey: string) {
+  const now = Date.now();
+  const existing = failedCodeAttempts.get(clientKey);
+  if (!existing || now > existing.resetAt) {
+    failedCodeAttempts.set(clientKey, {
+      count: 1,
+      resetAt: now + FAILED_CODE_WINDOW_MS,
+    });
+    return;
+  }
+  existing.count += 1;
+}
+
+function assertNotBruteForceLocked(clientKey: string) {
+  const now = Date.now();
+  const existing = failedCodeAttempts.get(clientKey);
+  if (existing && now <= existing.resetAt && existing.count >= MAX_FAILED_CODE_ATTEMPTS) {
+    throw new RateLimitError(
+      'Too many incorrect joining code attempts. Please wait 15 minutes before trying again.'
+    );
+  }
+  if (existing && now > existing.resetAt) {
+    failedCodeAttempts.delete(clientKey);
+  }
 }
 
 export class EmployeeService {
   /**
-   * Generates a cryptographically secure invitation token.
+   * Generates a cryptographically secure legacy token.
    */
   private static generateToken(): string {
     return crypto.randomBytes(32).toString('hex');
   }
 
   /**
-   * Creates and stores a new employee invitation with a 72-hour TTL.
+   * Generates an unambiguous human-shareable joining code: PDK-XXXX-XXXX.
+   */
+  private static generateJoiningCode(): string {
+    let chars = '';
+    for (let i = 0; i < 8; i += 1) {
+      chars += JOINING_CODE_ALPHABET[crypto.randomInt(0, JOINING_CODE_ALPHABET.length)];
+    }
+    return `PDK-${chars.slice(0, 4)}-${chars.slice(4, 8)}`;
+  }
+
+  /**
+   * Creates and stores a new employee invitation + unique joining code (72-hour TTL).
+   * Only HMAC-SHA256 digests are persisted; the plaintext joiningCode & token are returned once.
    */
   public static async createInvitation(
     tenantId: string,
@@ -79,12 +254,15 @@ export class EmployeeService {
   ): Promise<InvitationRecord> {
     const email = input.email.trim().toLowerCase();
     const token = this.generateToken();
+    const joiningCode = this.generateJoiningCode();
+    const tokenHash = hashSecretValue(token);
+    const joiningCodeHash = hashSecretValue(joiningCode);
     const now = new Date();
+    const nowIso = now.toISOString();
     const expiresAt = new Date(now.getTime() + 72 * 60 * 60 * 1000).toISOString();
 
     const isTestEnv = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
 
-    // Verify tenant exists
     if (!isTestEnv) {
       const db = firestore();
       const tenantDoc = await db.collection('tenants').doc(tenantId).get();
@@ -114,34 +292,106 @@ export class EmployeeService {
       throw new BadRequestError(err.message);
     }
 
+    // Check duplicate active employee or duplicate pending unexpired invitation for same email
+    if (isTestEnv) {
+      const activeMember = getTestMemberships(tenantId).find(
+        (m) => m.email?.toLowerCase() === email && m.status === 'active'
+      );
+      if (activeMember) {
+        throw new ConflictError('An active employee with this email already belongs to this pharmacy.');
+      }
+      const existingPending = getRawStoredTestInvitations(tenantId).find(
+        (inv) =>
+          inv.email.toLowerCase() === email &&
+          inv.status === 'pending' &&
+          new Date(inv.expiresAt).getTime() > now.getTime()
+      );
+      if (existingPending) {
+        throw new ConflictError(
+          'An active joining code already exists for this email. Generate a new code or revoke the existing one.'
+        );
+      }
+    } else {
+      const db = firestore();
+      const [memberSnap, pendingSnap] = await Promise.all([
+        db
+          .collection('tenants')
+          .doc(tenantId)
+          .collection('memberships')
+          .where('email', '==', email)
+          .where('status', '==', 'active')
+          .limit(1)
+          .get(),
+        db
+          .collection('tenants')
+          .doc(tenantId)
+          .collection('invitations')
+          .where('email', '==', email)
+          .where('status', '==', 'pending')
+          .get(),
+      ]);
+
+      if (!memberSnap.empty) {
+        throw new ConflictError('An active employee with this email already belongs to this pharmacy.');
+      }
+
+      const hasUnexpired = pendingSnap.docs.some(
+        (doc) => new Date((doc.data() as InvitationRecord).expiresAt).getTime() > now.getTime()
+      );
+      if (hasUnexpired) {
+        throw new ConflictError(
+          'An active joining code already exists for this email. Generate a new code or revoke the existing one.'
+        );
+      }
+    }
+
     const invitationId = `inv_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 
-    const invitation: InvitationRecord = {
+    const persistedInvitation: InvitationRecord = {
       id: invitationId,
       tenantId,
       email,
       name: input.name.trim(),
       phone: input.phone?.trim() || null,
       role: input.role,
-      assignedBranchIds: input.role === 'owner' && cleanBranches.length === 0 ? ['*'] : cleanBranches,
+      assignedBranchIds:
+        input.role === 'owner' && cleanBranches.length === 0 ? ['*'] : cleanBranches,
       permissionOverrides: validatedOverrides,
-      token,
+      tokenHash,
+      tokenLast6: token.slice(-6),
+      joiningCodeHash,
+      codeLast4: joiningCode.slice(-4),
+      joiningCodeMasked: `PDK-****-${joiningCode.slice(-4)}`,
       status: 'pending',
       expiresAt,
-      createdAt: now.toISOString(),
+      createdAt: nowIso,
       createdBy: actingUserId,
     };
 
+    const lookupRecord: JoiningCodeLookupRecord = {
+      codeHash: joiningCodeHash,
+      tenantId,
+      invitationId,
+      status: 'pending',
+      expiresAt,
+      createdAt: nowIso,
+    };
+
     if (isTestEnv) {
-      setTestInvitation(invitation);
+      setTestInvitation(persistedInvitation);
     } else {
       const db = firestore();
-      await db
-        .collection('tenants')
-        .doc(tenantId)
-        .collection('invitations')
-        .doc(invitationId)
-        .set(invitation);
+      const batch = db.batch();
+      batch.set(
+        db
+          .collection('tenants')
+          .doc(tenantId)
+          .collection('invitations')
+          .doc(invitationId),
+        persistedInvitation
+      );
+      batch.set(db.collection('joining_code_lookup').doc(joiningCodeHash), lookupRecord);
+      await batch.commit();
     }
 
     await AuditService.log({
@@ -149,64 +399,141 @@ export class EmployeeService {
       actingUserId,
       action: 'employee.invited',
       metadata: {
+        invitationId,
         email,
-        name: input.name,
+        name: input.name.trim(),
         role: input.role,
-        assignedBranchIds: invitation.assignedBranchIds,
+        assignedBranchIds: persistedInvitation.assignedBranchIds,
       },
     });
 
     logger.info(
       { tenantId, invitationId, email, role: input.role },
-      'Generated secure employee invitation'
+      'Generated secure employee joining code and invitation'
     );
 
-    return invitation;
+    return {
+      ...persistedInvitation,
+      token,
+      joiningCode,
+      displayStatus: 'Invitation Ready',
+    };
   }
 
   /**
-   * Lists all invitations for a tenant and marks expired ones.
+   * Lists all invitations for a tenant with masked secrets and clear human display statuses.
    */
   public static async listInvitations(tenantId: string): Promise<InvitationRecord[]> {
     const isTestEnv = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
     const now = Date.now();
-    const maskInvite = (invite: InvitationRecord): InvitationRecord => ({
-      ...invite,
-      token: invite.token ? `***${invite.token.slice(-6)}` : '',
-    });
+
+    const deriveDisplayStatus = async (
+      invite: InvitationRecord,
+      membersByUserId: Map<string, MembershipRecord>,
+      membersByEmail: Map<string, MembershipRecord>
+    ): Promise<StaffDisplayStatus> => {
+      if (invite.status === 'revoked' || invite.status === 'cancelled') {
+        return 'Invitation Revoked';
+      }
+      if (invite.status === 'expired' || (invite.status === 'pending' && now > new Date(invite.expiresAt).getTime())) {
+        return 'Invitation Expired';
+      }
+      if (invite.status === 'accepted') {
+        const linkedMember =
+          (invite.acceptedByUserId ? membersByUserId.get(invite.acceptedByUserId) : undefined) ||
+          membersByEmail.get(invite.email.toLowerCase());
+        if (linkedMember?.status === 'suspended' || linkedMember?.status === 'deactivated') {
+          return 'Suspended';
+        }
+        return 'Active';
+      }
+
+      // Pending invitation: check if Firebase account exists with unverified email
+      if (!isTestEnv) {
+        try {
+          const authUser = await adminAuth().getUserByEmail(invite.email);
+          if (authUser && !authUser.emailVerified) {
+            return 'Awaiting Account Setup';
+          }
+        } catch {
+          // User does not exist yet -> Invitation Ready
+        }
+      }
+      return 'Invitation Ready';
+    };
+
+    const sanitizeForList = (
+      invite: InvitationRecord,
+      displayStatus: StaffDisplayStatus
+    ): InvitationRecord => {
+      const effectiveStatus =
+        invite.status === 'pending' && now > new Date(invite.expiresAt).getTime()
+          ? 'expired'
+          : invite.status;
+      const last6 = invite.tokenLast6 || (invite.token ? invite.token.slice(-6) : '******');
+      const last4 = invite.codeLast4 || (invite.joiningCode ? invite.joiningCode.slice(-4) : '');
+      const copy: InvitationRecord = {
+        ...invite,
+        status: effectiveStatus,
+        token: `***${last6}`,
+        joiningCodeMasked: last4 ? `PDK-****-${last4}` : invite.joiningCodeMasked,
+        displayStatus,
+      };
+      delete copy.joiningCode;
+      return copy;
+    };
 
     if (isTestEnv) {
+      const members = getTestMemberships(tenantId);
+      const membersByUserId = new Map(members.map((m) => [m.userId, m]));
+      const membersByEmail = new Map(
+        members.filter((m) => m.email).map((m) => [m.email!.toLowerCase(), m])
+      );
+
       const list: InvitationRecord[] = [];
-      for (const [key, invite] of testInvitations.entries()) {
-        if (key.startsWith(`${tenantId}:`) && invite.id === key.split(':')[1]) {
-          if (invite.status === 'pending' && now > new Date(invite.expiresAt).getTime()) {
-            invite.status = 'expired';
-          }
-          list.push(maskInvite(invite));
+      for (const invite of getRawStoredTestInvitations(tenantId)) {
+        if (invite.status === 'pending' && now > new Date(invite.expiresAt).getTime()) {
+          invite.status = 'expired';
         }
+        const displayStatus = await deriveDisplayStatus(invite, membersByUserId, membersByEmail);
+        list.push(sanitizeForList(invite, displayStatus));
       }
       return list;
     }
 
     const db = firestore();
-    const snapshot = await db
-      .collection('tenants')
-      .doc(tenantId)
-      .collection('invitations')
-      .orderBy('createdAt', 'desc')
-      .get();
+    const [invSnap, memberSnap] = await Promise.all([
+      db
+        .collection('tenants')
+        .doc(tenantId)
+        .collection('invitations')
+        .orderBy('createdAt', 'desc')
+        .get(),
+      db.collection('tenants').doc(tenantId).collection('memberships').get(),
+    ]);
 
-    return snapshot.docs.map((doc) => {
-      const data = doc.data() as InvitationRecord;
-      if (data.status === 'pending' && now > new Date(data.expiresAt).getTime()) {
-        data.status = 'expired';
-      }
-      return maskInvite(data);
-    });
+    const members = memberSnap.docs.map((d) => d.data() as MembershipRecord);
+    const membersByUserId = new Map(members.map((m) => [m.userId, m]));
+    const membersByEmail = new Map(
+      members.filter((m) => m.email).map((m) => [m.email!.toLowerCase(), m])
+    );
+
+    return Promise.all(
+      invSnap.docs.map(async (doc) => {
+        const data = doc.data() as InvitationRecord;
+        if (data.status === 'pending' && now > new Date(data.expiresAt).getTime()) {
+          data.status = 'expired';
+        }
+        const displayStatus = await deriveDisplayStatus(data, membersByUserId, membersByEmail);
+        return sanitizeForList(data, displayStatus);
+      })
+    );
   }
 
   /**
-   * Resends an invitation with a refreshed token and renewed 72-hour expiration window.
+   * Regenerates / resends an invitation: invalidates the old joining code immediately,
+   * issues a brand new PDK-XXXX-XXXX joining code and 72-hour expiration window,
+   * and returns the new code once for private sharing.
    */
   public static async resendInvitation(
     tenantId: string,
@@ -235,56 +562,103 @@ export class EmployeeService {
       throw new NotFoundError(`Invitation '${invitationId}' not found.`);
     }
 
-    if (invitation.status === 'cancelled') {
-      throw new BadRequestError('Cannot resend a cancelled invitation. Please create a new invitation.');
-    }
-
     if (invitation.status === 'accepted') {
       throw new BadRequestError('Invitation has already been accepted.');
     }
 
+    const oldCodeHash = invitation.joiningCodeHash;
+    const oldTokenHash = invitation.tokenHash;
+
     const newToken = this.generateToken();
+    const newJoiningCode = this.generateJoiningCode();
+    const newTokenHash = hashSecretValue(newToken);
+    const newCodeHash = hashSecretValue(newJoiningCode);
     const now = new Date();
+    const nowIso = now.toISOString();
     const expiresAt = new Date(now.getTime() + 72 * 60 * 60 * 1000).toISOString();
 
-    invitation.token = newToken;
-    invitation.expiresAt = expiresAt;
-    invitation.status = 'pending';
+    const updatedRecord: InvitationRecord = {
+      ...invitation,
+      tokenHash: newTokenHash,
+      tokenLast6: newToken.slice(-6),
+      joiningCodeHash: newCodeHash,
+      codeLast4: newJoiningCode.slice(-4),
+      joiningCodeMasked: `PDK-****-${newJoiningCode.slice(-4)}`,
+      expiresAt,
+      status: 'pending',
+      updatedAt: nowIso,
+    };
+    delete updatedRecord.token;
+    delete updatedRecord.joiningCode;
 
     if (isTestEnv) {
-      setTestInvitation(invitation);
+      if (oldTokenHash) {
+        testInvitations.delete(`${tenantId}:hash:${oldTokenHash}`);
+      }
+      if (oldCodeHash) {
+        testJoiningCodeLookup.delete(oldCodeHash);
+      }
+      setTestInvitation(updatedRecord);
     } else {
       const db = firestore();
-      await db
+      const batch = db.batch();
+      const invRef = db
         .collection('tenants')
         .doc(tenantId)
         .collection('invitations')
-        .doc(invitationId)
-        .update({
-          token: newToken,
-          expiresAt,
-          status: 'pending',
-          updatedAt: now.toISOString(),
-        });
+        .doc(invitationId);
+
+      batch.update(invRef, {
+        tokenHash: newTokenHash,
+        tokenLast6: newToken.slice(-6),
+        joiningCodeHash: newCodeHash,
+        codeLast4: newJoiningCode.slice(-4),
+        joiningCodeMasked: updatedRecord.joiningCodeMasked,
+        expiresAt,
+        status: 'pending',
+        updatedAt: nowIso,
+      });
+
+      if (oldCodeHash) {
+        batch.delete(db.collection('joining_code_lookup').doc(oldCodeHash));
+      }
+
+      batch.set(db.collection('joining_code_lookup').doc(newCodeHash), {
+        codeHash: newCodeHash,
+        tenantId,
+        invitationId,
+        status: 'pending',
+        expiresAt,
+        createdAt: updatedRecord.createdAt,
+        updatedAt: nowIso,
+      });
+
+      await batch.commit();
     }
 
     await AuditService.log({
       tenantId,
       actingUserId,
-      action: 'employee.invitation_resent',
-      metadata: { invitationId, email: invitation.email },
+      action: 'employee.invitation_regenerated',
+      metadata: { invitationId, email: updatedRecord.email },
     });
 
-    return invitation;
+    return {
+      ...updatedRecord,
+      token: newToken,
+      joiningCode: newJoiningCode,
+      displayStatus: 'Invitation Ready',
+    };
   }
 
   /**
-   * Cancels a pending invitation.
+   * Revokes or cancels a pending/expired invitation and invalidates its joining code lookup entry.
    */
   public static async cancelInvitation(
     tenantId: string,
     invitationId: string,
-    actingUserId: string
+    actingUserId: string,
+    targetStatus: 'cancelled' | 'revoked' = 'cancelled'
   ): Promise<InvitationRecord> {
     const isTestEnv = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
     let invitation: InvitationRecord | null = null;
@@ -309,41 +683,403 @@ export class EmployeeService {
     }
 
     if (invitation.status === 'accepted') {
-      throw new BadRequestError('Cannot cancel an already accepted invitation.');
+      throw new BadRequestError('Cannot revoke an already accepted invitation.');
     }
 
-    invitation.status = 'cancelled';
+    const nowIso = new Date().toISOString();
+    invitation.status = targetStatus;
+    invitation.updatedAt = nowIso;
+    if (targetStatus === 'revoked') {
+      invitation.revokedAt = nowIso;
+      invitation.revokedBy = actingUserId;
+    }
 
     if (isTestEnv) {
       setTestInvitation(invitation);
+      if (invitation.joiningCodeHash && testJoiningCodeLookup.has(invitation.joiningCodeHash)) {
+        const lookup = testJoiningCodeLookup.get(invitation.joiningCodeHash)!;
+        lookup.status = targetStatus;
+        lookup.updatedAt = nowIso;
+      }
     } else {
       const db = firestore();
-      await db
-        .collection('tenants')
-        .doc(tenantId)
-        .collection('invitations')
-        .doc(invitationId)
-        .update({
-          status: 'cancelled',
-          cancelledAt: new Date().toISOString(),
-          cancelledBy: actingUserId,
-        });
+      const batch = db.batch();
+      batch.update(
+        db
+          .collection('tenants')
+          .doc(tenantId)
+          .collection('invitations')
+          .doc(invitationId),
+        {
+          status: targetStatus,
+          updatedAt: nowIso,
+          ...(targetStatus === 'revoked'
+            ? { revokedAt: nowIso, revokedBy: actingUserId }
+            : { cancelledAt: nowIso, cancelledBy: actingUserId }),
+        }
+      );
+      if (invitation.joiningCodeHash) {
+        batch.set(
+          db.collection('joining_code_lookup').doc(invitation.joiningCodeHash),
+          { status: targetStatus, updatedAt: nowIso },
+          { merge: true }
+        );
+      }
+      await batch.commit();
     }
 
     await AuditService.log({
       tenantId,
       actingUserId,
-      action: 'employee.invitation_cancelled',
+      action: targetStatus === 'revoked' ? 'employee.invitation_revoked' : 'employee.invitation_cancelled',
       metadata: { invitationId, email: invitation.email },
     });
 
-    return invitation;
+    return {
+      ...invitation,
+      displayStatus: 'Invitation Revoked',
+    };
   }
 
   /**
-   * Accepts an invitation by the authenticated user.
-   * Validates token, status, expiration, and email match.
-   * Atomically creates active membership with assigned role and branches.
+   * Public step-1 endpoint backing POST /api/v1/joining-codes/validate.
+   * Validates normalized joining code against hashed lookup without exposing tenantId or full PII.
+   */
+  public static async validateJoiningCode(options: {
+    joiningCode: string;
+    clientIp?: string;
+  }): Promise<ValidatedJoiningCodePreview> {
+    const clientKey = options.clientIp || 'unknown';
+    assertNotBruteForceLocked(clientKey);
+
+    const normalized = normalizeJoiningCode(options.joiningCode);
+    const codeHash = hashSecretValue(normalized);
+    const isTestEnv = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
+
+    let lookup: JoiningCodeLookupRecord | null = null;
+    let invitation: InvitationRecord | null = null;
+    let pharmacyName = 'PharmaDesk Pharmacy';
+    let assignedBranches: Array<{ id: string; name: string }> = [];
+
+    if (isTestEnv) {
+      lookup = testJoiningCodeLookup.get(codeHash) || null;
+      if (!lookup) {
+        recordFailedCodeAttempt(clientKey);
+        throw new NotFoundError('This joining code is incorrect.');
+      }
+      invitation = testInvitations.get(`${lookup.tenantId}:${lookup.invitationId}`) || null;
+      if (!invitation) {
+        recordFailedCodeAttempt(clientKey);
+        throw new NotFoundError('This joining code is incorrect.');
+      }
+      const tenant = getTestTenant(lookup.tenantId);
+      if (tenant?.name) {
+        pharmacyName = String(tenant.name);
+      }
+      const branches = await BranchService.listBranches(lookup.tenantId);
+      assignedBranches = (invitation.assignedBranchIds || []).map((branchId) => {
+        const matched = branches.find((b) => b.id === branchId);
+        return {
+          id: branchId,
+          name: matched?.name || (branchId === 'main' ? 'Main Store' : branchId),
+        };
+      });
+    } else {
+      const db = firestore();
+      const lookupSnap = await db.collection('joining_code_lookup').doc(codeHash).get();
+      if (!lookupSnap.exists) {
+        recordFailedCodeAttempt(clientKey);
+        throw new NotFoundError('This joining code is incorrect.');
+      }
+      lookup = lookupSnap.data() as JoiningCodeLookupRecord;
+
+      const [invSnap, tenantSnap, branchSnap] = await Promise.all([
+        db
+          .collection('tenants')
+          .doc(lookup.tenantId)
+          .collection('invitations')
+          .doc(lookup.invitationId)
+          .get(),
+        db.collection('tenants').doc(lookup.tenantId).get(),
+        db.collection('tenants').doc(lookup.tenantId).collection('branches').get(),
+      ]);
+
+      if (!invSnap.exists) {
+        recordFailedCodeAttempt(clientKey);
+        throw new NotFoundError('This joining code is incorrect.');
+      }
+      invitation = invSnap.data() as InvitationRecord;
+      if (tenantSnap.exists && tenantSnap.data()?.name) {
+        pharmacyName = String(tenantSnap.data()!.name);
+      }
+      const branchDocs = branchSnap.docs.map((d) => d.data() as { id: string; name?: string });
+      assignedBranches = (invitation.assignedBranchIds || []).map((branchId) => {
+        const matched = branchDocs.find((b) => b.id === branchId);
+        return {
+          id: branchId,
+          name: matched?.name || (branchId === 'main' ? 'Main Store' : branchId),
+        };
+      });
+    }
+
+    if (invitation.status === 'revoked' || invitation.status === 'cancelled') {
+      throw new BadRequestError('This joining code has been revoked by the pharmacy owner.');
+    }
+    if (invitation.status === 'accepted') {
+      throw new ConflictError('This joining code has already been used.');
+    }
+    if (
+      invitation.status === 'expired' ||
+      Date.now() > new Date(invitation.expiresAt).getTime()
+    ) {
+      throw new BadRequestError('This joining code has expired. Ask your pharmacy owner for a new code.');
+    }
+
+    // Valid code clears failure count for this IP
+    failedCodeAttempts.delete(clientKey);
+
+    return {
+      valid: true,
+      pharmacyName,
+      assignedRole: invitation.role,
+      assignedRoleLabel: ROLE_LABELS[invitation.role] || invitation.role,
+      assignedBranches,
+      maskedEmail: maskEmail(invitation.email),
+      expiresAt: invitation.expiresAt,
+    };
+  }
+
+  /**
+   * Redeems a single-use joining code on behalf of an authenticated, email-verified user.
+   * Atomically activates the owner-chosen role & branch access and burns the joining code.
+   */
+  public static async redeemJoiningCode(options: {
+    joiningCode: string;
+    userId: string;
+    userEmail?: string;
+    emailVerified: boolean;
+  }): Promise<MembershipRecord> {
+    if (!options.emailVerified) {
+      throw new ForbiddenError('Please verify your email address before joining this pharmacy.');
+    }
+
+    const normalized = normalizeJoiningCode(options.joiningCode);
+    const codeHash = hashSecretValue(normalized);
+    const isTestEnv = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
+    const now = Date.now();
+    const nowIso = new Date().toISOString();
+
+    if (isTestEnv) {
+      const lookup = testJoiningCodeLookup.get(codeHash);
+      if (!lookup) {
+        throw new NotFoundError('This joining code is incorrect.');
+      }
+
+      const lockKey = `${lookup.tenantId}:${lookup.invitationId}`;
+      if (activeRedemptionLocks.has(lockKey)) {
+        throw new ConflictError('This joining code has already been used.');
+      }
+      activeRedemptionLocks.add(lockKey);
+
+      try {
+        const invitation = testInvitations.get(`${lookup.tenantId}:${lookup.invitationId}`);
+        if (!invitation) {
+          throw new NotFoundError('This joining code is incorrect.');
+        }
+        if (invitation.status === 'revoked' || invitation.status === 'cancelled') {
+          throw new BadRequestError('This joining code has been revoked by the pharmacy owner.');
+        }
+        if (invitation.status === 'accepted') {
+          throw new ConflictError('This joining code has already been used.');
+        }
+        if (invitation.status === 'expired' || now > new Date(invitation.expiresAt).getTime()) {
+          invitation.status = 'expired';
+          throw new BadRequestError('This joining code has expired. Ask your pharmacy owner for a new code.');
+        }
+        if (
+          !options.userEmail ||
+          invitation.email.toLowerCase() !== options.userEmail.trim().toLowerCase()
+        ) {
+          throw new ForbiddenError('Please use the email address provided by your pharmacy owner.');
+        }
+
+        const existingMember = getTestMemberships(lookup.tenantId).find(
+          (m) => m.userId === options.userId
+        );
+        if (existingMember && existingMember.status === 'active') {
+          throw new ConflictError('You already have an active membership in this pharmacy.');
+        }
+
+        const cleanBranches = (invitation.assignedBranchIds || [])
+          .map((b) => b.trim())
+          .filter(Boolean);
+        if (invitation.role !== 'owner' && (cleanBranches.length === 0 || cleanBranches.includes('*'))) {
+          throw new BadRequestError('Invitation is missing valid branch assignments for non-owner role.');
+        }
+
+        const effectivePermissions = resolveEffectivePermissions(
+          invitation.role,
+          invitation.permissionOverrides
+        );
+
+        const membership: MembershipRecord = {
+          tenantId: lookup.tenantId,
+          userId: options.userId,
+          role: invitation.role,
+          status: 'active',
+          assignedBranchIds: cleanBranches,
+          permissionOverrides: invitation.permissionOverrides,
+          permissions: effectivePermissions,
+          name: invitation.name,
+          email: invitation.email,
+          phone: invitation.phone || undefined,
+          invitedBy: invitation.createdBy,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+
+        invitation.status = 'accepted';
+        invitation.acceptedByUserId = options.userId;
+        invitation.acceptedAt = nowIso;
+        lookup.status = 'accepted';
+        lookup.updatedAt = nowIso;
+
+        setTestMembership(lookup.tenantId, options.userId, membership);
+        setTestInvitation(invitation);
+
+        await AuditService.log({
+          tenantId: lookup.tenantId,
+          actingUserId: options.userId,
+          targetUserId: options.userId,
+          action: 'employee.joining_code_redeemed',
+          metadata: {
+            invitationId: invitation.id,
+            role: membership.role,
+            assignedBranchIds: membership.assignedBranchIds,
+          },
+        });
+
+        return membership;
+      } finally {
+        activeRedemptionLocks.delete(lockKey);
+      }
+    }
+
+    const db = firestore();
+    const lookupRef = db.collection('joining_code_lookup').doc(codeHash);
+
+    const newMembership = await db.runTransaction(async (tx) => {
+      const lookupSnap = await tx.get(lookupRef);
+      if (!lookupSnap.exists) {
+        throw new NotFoundError('This joining code is incorrect.');
+      }
+      const lookup = lookupSnap.data() as JoiningCodeLookupRecord;
+
+      const tenantRef = db.collection('tenants').doc(lookup.tenantId);
+      const invRef = tenantRef.collection('invitations').doc(lookup.invitationId);
+      const memberRef = tenantRef.collection('memberships').doc(options.userId);
+      const userRef = db.collection('users').doc(options.userId);
+
+      const [invSnap, memberSnap] = await Promise.all([tx.get(invRef), tx.get(memberRef)]);
+      if (!invSnap.exists) {
+        throw new NotFoundError('This joining code is incorrect.');
+      }
+
+      const invData = invSnap.data() as InvitationRecord;
+      if (invData.status === 'revoked' || invData.status === 'cancelled') {
+        throw new BadRequestError('This joining code has been revoked by the pharmacy owner.');
+      }
+      if (invData.status === 'accepted' || lookup.status === 'accepted') {
+        throw new ConflictError('This joining code has already been used.');
+      }
+      if (invData.status === 'expired' || now > new Date(invData.expiresAt).getTime()) {
+        throw new BadRequestError('This joining code has expired. Ask your pharmacy owner for a new code.');
+      }
+      if (
+        !options.userEmail ||
+        invData.email.toLowerCase() !== options.userEmail.trim().toLowerCase()
+      ) {
+        throw new ForbiddenError('Please use the email address provided by your pharmacy owner.');
+      }
+
+      if (memberSnap.exists) {
+        const existingMember = memberSnap.data() as MembershipRecord;
+        if (existingMember.status === 'active') {
+          throw new ConflictError('You already have an active membership in this pharmacy.');
+        }
+      }
+
+      const cleanBranches = (invData.assignedBranchIds || []).map((b) => b.trim()).filter(Boolean);
+      if (invData.role !== 'owner' && (cleanBranches.length === 0 || cleanBranches.includes('*'))) {
+        throw new BadRequestError('Invitation is missing valid branch assignments for non-owner role.');
+      }
+
+      const effectivePermissions = resolveEffectivePermissions(
+        invData.role,
+        invData.permissionOverrides
+      );
+
+      const membershipPayload: MembershipRecord = {
+        tenantId: lookup.tenantId,
+        userId: options.userId,
+        role: invData.role,
+        status: 'active',
+        assignedBranchIds: cleanBranches,
+        permissionOverrides: invData.permissionOverrides,
+        permissions: effectivePermissions,
+        name: invData.name,
+        email: invData.email,
+        phone: invData.phone || undefined,
+        invitedBy: invData.createdBy,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      tx.set(memberRef, membershipPayload);
+      tx.update(invRef, {
+        status: 'accepted',
+        acceptedByUserId: options.userId,
+        acceptedAt: nowIso,
+        updatedAt: nowIso,
+      });
+      tx.update(lookupRef, {
+        status: 'accepted',
+        updatedAt: nowIso,
+      });
+      tx.set(
+        userRef,
+        {
+          uid: options.userId,
+          lastActiveTenantId: lookup.tenantId,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      return membershipPayload;
+    });
+
+    await AuditService.log({
+      tenantId: newMembership.tenantId,
+      actingUserId: options.userId,
+      targetUserId: options.userId,
+      action: 'employee.joining_code_redeemed',
+      metadata: {
+        role: newMembership.role,
+        assignedBranchIds: newMembership.assignedBranchIds,
+      },
+    });
+
+    logger.info(
+      { tenantId: newMembership.tenantId, userId: options.userId, role: newMembership.role },
+      'Employee joining code redeemed and membership activated'
+    );
+
+    return newMembership;
+  }
+
+  /**
+   * Legacy token-based invitation acceptance kept compatible for existing integrations/tests.
    */
   public static async acceptInvitation(options: {
     tenantId: string;
@@ -352,21 +1088,20 @@ export class EmployeeService {
     userEmail?: string;
   }) {
     const { tenantId, token, userId, userEmail } = options;
+    const tokenHash = hashSecretValue(token);
     const isTestEnv = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
-
-    let invitation: InvitationRecord | null = null;
 
     const now = Date.now();
     const nowIso = new Date().toISOString();
     let newMembership: MembershipRecord;
 
     if (isTestEnv) {
-      invitation = testInvitations.get(`${tenantId}:${token}`) || null;
+      const invitation = testInvitations.get(`${tenantId}:hash:${tokenHash}`) || null;
 
       if (!invitation) {
         throw new NotFoundError('Invalid invitation token or pharmacy tenant.');
       }
-      if (invitation.status === 'cancelled') {
+      if (invitation.status === 'cancelled' || invitation.status === 'revoked') {
         throw new BadRequestError('This invitation has been cancelled by the pharmacy owner.');
       }
       if (invitation.status === 'accepted') {
@@ -419,10 +1154,13 @@ export class EmployeeService {
 
       setTestMembership(tenantId, userId, newMembership);
       setTestInvitation(invitation);
+      if (invitation.joiningCodeHash && testJoiningCodeLookup.has(invitation.joiningCodeHash)) {
+        testJoiningCodeLookup.get(invitation.joiningCodeHash)!.status = 'accepted';
+      }
     } else {
       const db = firestore();
       const tenantRef = db.collection('tenants').doc(tenantId);
-      const inviteQuery = tenantRef.collection('invitations').where('token', '==', token).limit(1);
+      const inviteQuery = tenantRef.collection('invitations').where('tokenHash', '==', tokenHash).limit(1);
       const memberRef = tenantRef.collection('memberships').doc(userId);
       const userRef = db.collection('users').doc(userId);
 
@@ -439,7 +1177,7 @@ export class EmployeeService {
         const invDoc = inviteSnap.docs[0];
         const invData = invDoc.data() as InvitationRecord;
 
-        if (invData.status === 'cancelled') {
+        if (invData.status === 'cancelled' || invData.status === 'revoked') {
           throw new BadRequestError('This invitation has been cancelled by the pharmacy owner.');
         }
         if (invData.status === 'accepted') {
@@ -493,6 +1231,13 @@ export class EmployeeService {
           acceptedByUserId: userId,
           acceptedAt: nowIso,
         });
+        if (invData.joiningCodeHash) {
+          tx.set(
+            db.collection('joining_code_lookup').doc(invData.joiningCodeHash),
+            { status: 'accepted', updatedAt: nowIso },
+            { merge: true }
+          );
+        }
         tx.set(
           userRef,
           {
@@ -528,6 +1273,7 @@ export class EmployeeService {
 
   /**
    * Updates an employee's role. Recomputes effective permissions with existing overrides.
+   * Prevents demoting the last active pharmacy owner.
    */
   public static async updateRole(
     tenantId: string,
@@ -537,20 +1283,20 @@ export class EmployeeService {
   ) {
     const isTestEnv = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
     let member: MembershipRecord | null = null;
+    let allMembers: MembershipRecord[] = [];
 
     if (isTestEnv) {
-      member = getTestMemberships(tenantId).find((m) => m.userId === targetUserId) || null;
+      allMembers = getTestMemberships(tenantId);
+      member = allMembers.find((m) => m.userId === targetUserId) || null;
     } else {
       const db = firestore();
-      const doc = await db
+      const snap = await db
         .collection('tenants')
         .doc(tenantId)
         .collection('memberships')
-        .doc(targetUserId)
         .get();
-      if (doc.exists) {
-        member = doc.data() as MembershipRecord;
-      }
+      allMembers = snap.docs.map((d) => d.data() as MembershipRecord);
+      member = allMembers.find((m) => m.userId === targetUserId) || null;
     }
 
     if (!member) {
@@ -559,6 +1305,13 @@ export class EmployeeService {
 
     if (member.role === 'owner' && targetUserId === actingUserId && newRole !== 'owner') {
       throw new BadRequestError('Primary pharmacy owner cannot demote their own role.');
+    }
+
+    if (member.role === 'owner' && member.status === 'active' && newRole !== 'owner') {
+      const activeOwners = allMembers.filter((m) => m.role === 'owner' && m.status === 'active');
+      if (activeOwners.length <= 1) {
+        throw new BadRequestError('Cannot demote the last active pharmacy owner.');
+      }
     }
 
     const previousRole = member.role;
@@ -698,7 +1451,6 @@ export class EmployeeService {
       throw new NotFoundError(`Employee '${targetUserId}' not found in this pharmacy.`);
     }
 
-    // Owner permissions cannot be revoked or overridden
     if (member.role === 'owner') {
       throw new BadRequestError('Cannot override permissions for pharmacy owner.');
     }
@@ -743,7 +1495,7 @@ export class EmployeeService {
 
   /**
    * Updates employee status: 'active', 'suspended', or 'deactivated'.
-   * Deactivation triggers immediate revocation on subsequent API calls.
+   * Protects the last active pharmacy owner and preserves other pharmacy memberships & historical records.
    */
   public static async updateStatus(
     tenantId: string,
@@ -757,24 +1509,31 @@ export class EmployeeService {
 
     const isTestEnv = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
     let member: MembershipRecord | null = null;
+    let allMembers: MembershipRecord[] = [];
 
     if (isTestEnv) {
-      member = getTestMemberships(tenantId).find((m) => m.userId === targetUserId) || null;
+      allMembers = getTestMemberships(tenantId);
+      member = allMembers.find((m) => m.userId === targetUserId) || null;
     } else {
       const db = firestore();
-      const doc = await db
+      const snap = await db
         .collection('tenants')
         .doc(tenantId)
         .collection('memberships')
-        .doc(targetUserId)
         .get();
-      if (doc.exists) {
-        member = doc.data() as MembershipRecord;
-      }
+      allMembers = snap.docs.map((d) => d.data() as MembershipRecord);
+      member = allMembers.find((m) => m.userId === targetUserId) || null;
     }
 
     if (!member) {
       throw new NotFoundError(`Employee '${targetUserId}' not found in this pharmacy.`);
+    }
+
+    if (member.role === 'owner' && member.status === 'active' && status !== 'active') {
+      const activeOwners = allMembers.filter((m) => m.role === 'owner' && m.status === 'active');
+      if (activeOwners.length <= 1) {
+        throw new BadRequestError('Cannot suspend or remove the last active pharmacy owner.');
+      }
     }
 
     member.status = status;

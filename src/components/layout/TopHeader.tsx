@@ -36,8 +36,6 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
   const {
     store,
     currentUser,
-    switchUserRole,
-    usersList,
     setActiveModule,
     notifications,
     setIsStoreOnboardingOpen,
@@ -64,6 +62,12 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
   const unreadCount = notifications.filter(n => !n.read).length;
   const canConsolidated = hasUserPermission('reports.consolidated.view');
   const canViewBranches = hasUserPermission('branches.view');
+  const roleLabel =
+    currentUser.role === 'owner'
+      ? 'Pharmacy Owner'
+      : currentUser.role === 'helper'
+      ? 'Store Helper'
+      : currentUser.role.charAt(0).toUpperCase() + currentUser.role.slice(1);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -114,8 +118,12 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
               </div>
               <div className="flex items-center gap-1.5 text-[11px] text-slate-500">
                 <span className="truncate max-w-[140px]">{store.name}</span>
-                <span aria-hidden="true">·</span>
-                <span className="font-mono">GSTIN {store.gstin.slice(0, 10)}</span>
+                {store.gstin && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="font-mono">GSTIN {store.gstin.slice(0, 10)}</span>
+                  </>
+                )}
                 {!consolidatedViewMode && activeBranch && activeBranch.status !== 'ACTIVE' && (
                   <>
                     <span aria-hidden="true">·</span>
@@ -132,7 +140,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
               {memberships.length > 1 && (
                 <div className="px-3 pb-2 mb-2 border-b border-slate-100">
                   <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 block mb-1.5">
-                    Pharmacy Workspaces ({memberships.length})
+                    Your Pharmacies ({memberships.length})
                   </span>
                   <div className="space-y-1 max-h-32 overflow-y-auto">
                     {memberships.map((m) => {
@@ -162,7 +170,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
 
               <div className="px-3 pb-2 border-b border-slate-100 flex items-center justify-between">
                 <span className="text-xs font-semibold text-slate-600">
-                  Active Branch Workspace ({authorizedBranches.length})
+                  Store Branches ({authorizedBranches.length})
                 </span>
                 <span className="text-[11px] font-mono text-slate-400">{store.name}</span>
               </div>
@@ -231,7 +239,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                   >
                     <span className="flex items-center gap-1.5">
                       <Layers className="w-3.5 h-3.5" />
-                      <span>Consolidated View (All Branches)</span>
+                      <span>All Branches Overview</span>
                     </span>
                     {consolidatedViewMode && <CheckCircle2 className="w-3.5 h-3.5" />}
                   </button>
@@ -260,7 +268,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                     className="w-full py-1.5 px-3 rounded-lg text-xs font-medium text-blue-600 hover:text-blue-700 hover:bg-blue-50 border border-dashed border-blue-300 flex items-center justify-center gap-1.5 transition-colors"
                   >
                     <Plus className="w-3.5 h-3.5" />
-                    <span>Store Setup</span>
+                    <span>Store Details</span>
                   </button>
                 )}
               </div>
@@ -318,8 +326,8 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
               <span className="text-xs font-semibold text-slate-800 block leading-tight truncate max-w-[120px]">
                 {currentUser.name}
               </span>
-              <span className="text-[10px] text-slate-500 capitalize block leading-tight">
-                {currentUser.role === 'owner' ? 'Pharmacy Owner' : currentUser.role}
+              <span className="text-[10px] text-slate-500 block leading-tight">
+                {roleLabel}
               </span>
             </div>
             <ChevronDown className="w-3.5 h-3.5 text-slate-400 hidden sm:block" />
@@ -334,39 +342,11 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                 <span className="text-[11px] text-slate-500 block truncate">
                   {currentUser.email}
                 </span>
-                <div className="mt-1 flex items-center gap-1 text-[11px] font-medium text-blue-700 bg-blue-50 px-2 py-0.5 rounded w-fit capitalize">
+                <div className="mt-1 flex items-center gap-1 text-[11px] font-medium text-blue-700 bg-blue-50 px-2 py-0.5 rounded w-fit">
                   <ShieldCheck className="w-3 h-3 text-blue-600" />
-                  <span>Role: {currentUser.role}</span>
+                  <span>{roleLabel}</span>
                 </div>
               </div>
-
-              {/* Role Switcher in Profile (Local Development Preview Only) */}
-              {!import.meta.env.PROD && !firebaseSession.authenticated && (
-                <div className="px-4 py-2 border-b border-slate-100">
-                  <span className="text-[11px] font-medium text-slate-500 block mb-1">
-                    Switch Active Role (Dev Preview):
-                  </span>
-                  <div className="space-y-1">
-                    {usersList.map(u => (
-                      <button
-                        key={u.id}
-                        onClick={() => {
-                          switchUserRole(u.role);
-                          setIsProfileMenuOpen(false);
-                        }}
-                        className={`w-full text-left px-2 py-1 rounded text-xs flex items-center justify-between ${
-                          currentUser.role === u.role
-                            ? 'bg-blue-50 text-blue-700 font-semibold'
-                            : 'text-slate-700 hover:bg-slate-50'
-                        }`}
-                      >
-                        <span className="capitalize">{u.role}: {u.name}</span>
-                        {currentUser.role === u.role && <CheckCircle2 className="w-3.5 h-3.5 text-blue-600" />}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
 
               <div className="py-1">
                 <button
@@ -377,18 +357,20 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                   className="w-full px-4 py-2 text-left text-xs text-slate-700 hover:bg-slate-50 flex items-center gap-2"
                 >
                   <User className="w-3.5 h-3.5 text-slate-400" />
-                  <span>{firebaseSession.authenticated ? 'Account & Session' : 'Staff Authentication / Sign In'}</span>
+                  <span>My Account</span>
                 </button>
-                <button
-                  onClick={() => {
-                    setIsProfileMenuOpen(false);
-                    setIsStoreOnboardingOpen(true);
-                  }}
-                  className="w-full px-4 py-2 text-left text-xs text-slate-700 hover:bg-slate-50 flex items-center gap-2"
-                >
-                  <Building2 className="w-3.5 h-3.5 text-slate-400" />
-                  <span>Store Onboarding Wizard</span>
-                </button>
+                {(currentUser.role === 'owner' || hasUserPermission('settings.manage')) && (
+                  <button
+                    onClick={() => {
+                      setIsProfileMenuOpen(false);
+                      setIsStoreOnboardingOpen(true);
+                    }}
+                    className="w-full px-4 py-2 text-left text-xs text-slate-700 hover:bg-slate-50 flex items-center gap-2"
+                  >
+                    <Building2 className="w-3.5 h-3.5 text-slate-400" />
+                    <span>Store Details &amp; Licenses</span>
+                  </button>
+                )}
                 {onReturnToSite && (
                   <button
                     onClick={() => {

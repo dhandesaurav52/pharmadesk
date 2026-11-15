@@ -42,6 +42,23 @@ export interface ActiveTenantMembership {
   tenantName?: string;
 }
 
+export interface InactiveTenantMembership {
+  tenantId: string;
+  tenantName?: string;
+  role: UserRole;
+  status: 'suspended' | 'deactivated' | string;
+}
+
+export interface JoiningCodePreview {
+  valid: true;
+  pharmacyName: string;
+  assignedRole: UserRole;
+  assignedRoleLabel: string;
+  assignedBranches: Array<{ id: string; name: string }>;
+  maskedEmail: string;
+  expiresAt: string;
+}
+
 async function workspaceRequest<T>(
   session: Pick<ApiSessionConfig, 'bearerToken' | 'appCheckToken'> & {
     tenantId?: string;
@@ -330,7 +347,7 @@ export function mapApiMemberToUserProfile(m: any): UserProfile {
 }
 
 export interface CreateTenantPayload {
-  tenantId: string;
+  tenantId?: string;
   name: string;
   legalName?: string;
   dlNumber20B: string;
@@ -347,12 +364,34 @@ export interface CreateTenantPayload {
   invoicePrefix?: string;
   thermalPrinter?: boolean;
   defaultDiscountPercent?: number;
+  idempotencyKey?: string;
+  ownerName?: string;
+}
+
+async function publicWorkspaceRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers || {});
+  if (init.body && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+  const response = await fetch(resolveApiUrl(path), { ...init, headers });
+  const ct = response.headers.get('content-type') || '';
+  const payload = ct.includes('json') ? await response.json() : { detail: await response.text() };
+  if (!response.ok) {
+    throw new ApiClientError(
+      response.status,
+      payload?.title || `HTTP ${response.status}`,
+      payload?.detail || payload?.message || 'Request failed',
+      payload?.errors
+    );
+  }
+  return payload as T;
 }
 
 export const workspaceApi = {
   async createTenant(
     auth: Pick<ApiSessionConfig, 'bearerToken' | 'appCheckToken'>,
-    payload: CreateTenantPayload
+    payload: CreateTenantPayload,
+    idempotencyKey = payload.idempotencyKey || generateIdempotencyKey('tenant_create')
   ) {
     const res = await workspaceRequest<{
       success: boolean;
@@ -360,7 +399,34 @@ export const workspaceApi = {
     }>(auth, '/api/v1/tenants', {
       method: 'POST',
       omitTenantHeader: true,
-      body: JSON.stringify(payload),
+      idempotencyKey,
+      body: JSON.stringify({ ...payload, idempotencyKey }),
+    });
+    return res.data;
+  },
+
+  async validateJoiningCode(joiningCode: string): Promise<JoiningCodePreview> {
+    const res = await publicWorkspaceRequest<{
+      success: boolean;
+      data: JoiningCodePreview;
+    }>('/api/v1/joining-codes/validate', {
+      method: 'POST',
+      body: JSON.stringify({ joiningCode }),
+    });
+    return res.data;
+  },
+
+  async redeemJoiningCode(
+    auth: Pick<ApiSessionConfig, 'bearerToken' | 'appCheckToken'>,
+    joiningCode: string
+  ): Promise<ActiveTenantMembership> {
+    const res = await workspaceRequest<{
+      success: boolean;
+      data: ActiveTenantMembership;
+    }>(auth, '/api/v1/joining-codes/redeem', {
+      method: 'POST',
+      omitTenantHeader: true,
+      body: JSON.stringify({ joiningCode }),
     });
     return res.data;
   },
@@ -635,10 +701,11 @@ export const workspaceApi = {
       assignedBranchIds: string[];
       permissionOverrides?: { granted?: string[]; revoked?: string[] };
     }
-  ): Promise<{ invitation: EmployeeInvitation; inviteLink: string }> {
+  ): Promise<{ invitation: EmployeeInvitation; joiningCode: string; inviteLink: string }> {
     const res = await workspaceRequest<{
       success: boolean;
       data: EmployeeInvitation;
+      joiningCode?: string;
       inviteLink?: string;
     }>(session, `/api/v1/tenants/${encodeURIComponent(session.tenantId)}/invitations`, {
       method: 'POST',
@@ -646,24 +713,48 @@ export const workspaceApi = {
     });
     return {
       invitation: res.data,
-      inviteLink:
-        res.inviteLink || `/invite/${res.data.token}?tenantId=${encodeURIComponent(session.tenantId)}`,
+      joiningCode: res.joiningCode || res.data.joiningCode || '',
+      inviteLink: res.inviteLink || '/join-pharmacy',
     };
   },
 
-  async resendInvitation(session: ApiSessionConfig, invitationId: string) {
+  async regenerateInvitation(session: ApiSessionConfig, invitationId: string): Promise<{
+    invitation: EmployeeInvitation;
+    joiningCode: string;
+    inviteLink?: string;
+  }> {
     const res = await workspaceRequest<{
       success: boolean;
       data: EmployeeInvitation;
+      joiningCode?: string;
       inviteLink?: string;
     }>(
       session,
       `/api/v1/tenants/${encodeURIComponent(session.tenantId)}/invitations/${encodeURIComponent(
         invitationId
-      )}/resend`,
+      )}/regenerate`,
       { method: 'POST' }
     );
-    return { invitation: res.data, inviteLink: res.inviteLink };
+    return {
+      invitation: res.data,
+      joiningCode: res.joiningCode || res.data.joiningCode || '',
+      inviteLink: res.inviteLink,
+    };
+  },
+
+  async resendInvitation(session: ApiSessionConfig, invitationId: string) {
+    return this.regenerateInvitation(session, invitationId);
+  },
+
+  async revokeInvitation(session: ApiSessionConfig, invitationId: string) {
+    const res = await workspaceRequest<{ success: boolean; data: EmployeeInvitation }>(
+      session,
+      `/api/v1/tenants/${encodeURIComponent(session.tenantId)}/invitations/${encodeURIComponent(
+        invitationId
+      )}/revoke`,
+      { method: 'POST' }
+    );
+    return res.data;
   },
 
   async cancelInvitation(session: ApiSessionConfig, invitationId: string) {

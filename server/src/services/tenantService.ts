@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { adminAuth, firestore } from '../lib/firebaseAdmin';
 import { BadRequestError, NotFoundError, ConflictError } from '../lib/errors';
 import { UserRole } from '../types/express';
@@ -14,7 +15,7 @@ import { AuditService } from './auditService';
 import { BranchService } from './branchService';
 
 export interface CreateTenantInput {
-  tenantId: string;
+  tenantId?: string;
   name: string;
   legalName?: string;
   dlNumber20B: string;
@@ -31,6 +32,8 @@ export interface CreateTenantInput {
   invoicePrefix?: string;
   thermalPrinter?: boolean;
   defaultDiscountPercent?: number;
+  idempotencyKey?: string;
+  ownerName?: string;
 }
 
 export interface UpdateTenantInput {
@@ -62,9 +65,32 @@ export interface InviteMemberInput {
 }
 
 const testTenantStore = new Map<string, Record<string, any>>();
+const testTenantIdempotency = new Map<
+  string,
+  { tenant: Record<string, any>; branch: Record<string, any>; membership: MembershipRecord }
+>();
+
+export function setTestTenant(tenantId: string, data: Record<string, any>) {
+  testTenantStore.set(tenantId, data);
+}
+
+export function getTestTenant(tenantId: string): Record<string, any> | undefined {
+  return testTenantStore.get(tenantId);
+}
 
 export function clearTestTenants() {
   testTenantStore.clear();
+  testTenantIdempotency.clear();
+}
+
+function generateTenantSlug(name: string): string {
+  const base = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 36);
+  const suffix = crypto.randomBytes(3).toString('hex');
+  return `${base || 'pharmacy'}-${suffix}`;
 }
 
 export class TenantService {
@@ -74,9 +100,21 @@ export class TenantService {
    * 2. Creates the default primary branch `tenants/{tenantId}/branches/main`.
    * 3. Creates the owner membership `tenants/{tenantId}/memberships/{ownerId}`.
    * 4. Updates the user's global registry in `users/{ownerId}`.
+   * Supports idempotent retries when `idempotencyKey` is supplied by the same owner.
    */
   public static async createTenant(ownerId: string, input: CreateTenantInput) {
     const isTestEnv = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
+    const idempotencyKey = input.idempotencyKey?.trim();
+    const idempMapKey = idempotencyKey ? `${ownerId}:${idempotencyKey}` : null;
+
+    if (idempMapKey && isTestEnv && testTenantIdempotency.has(idempMapKey)) {
+      return { ...testTenantIdempotency.get(idempMapKey)!, idempotentReplay: true };
+    }
+
+    const resolvedTenantId = input.tenantId?.trim()
+      ? input.tenantId.trim().toLowerCase()
+      : generateTenantSlug(input.name);
+
     const now = new Date().toISOString();
 
     const invoicePrefix = (
@@ -86,7 +124,7 @@ export class TenantService {
     ).toUpperCase();
 
     const tenantData = {
-      id: input.tenantId,
+      id: resolvedTenantId,
       name: input.name.trim(),
       legalName: (input.legalName || input.name).trim(),
       dlNumber20B: input.dlNumber20B.trim(),
@@ -112,7 +150,7 @@ export class TenantService {
 
     const mainBranchData = {
       id: 'main',
-      tenantId: input.tenantId,
+      tenantId: resolvedTenantId,
       name: `${input.name.trim()} (Main Store)`,
       branchCode: 'MAIN',
       branchType: 'MAIN',
@@ -145,57 +183,120 @@ export class TenantService {
     };
 
     const ownerMembership: MembershipRecord = {
-      tenantId: input.tenantId,
+      tenantId: resolvedTenantId,
       userId: ownerId,
       role: 'owner',
       status: 'active',
       assignedBranchIds: ['main', '*'],
       permissions: ['*'],
       email: input.contactEmail.trim(),
-      name: `${input.name.trim()} Owner`,
+      name: (input.ownerName || `${input.name.trim()} Owner`).trim(),
       createdAt: now,
       updatedAt: now,
     };
 
     if (isTestEnv) {
-      if (testTenantStore.has(input.tenantId)) {
-        throw new ConflictError(`Pharmacy with ID '${input.tenantId}' already exists.`);
+      if (testTenantStore.has(resolvedTenantId)) {
+        throw new ConflictError(`Pharmacy with ID '${resolvedTenantId}' already exists.`);
       }
-      testTenantStore.set(input.tenantId, tenantData);
-      setTestMembership(input.tenantId, ownerId, ownerMembership);
+      testTenantStore.set(resolvedTenantId, tenantData);
+      setTestMembership(resolvedTenantId, ownerId, ownerMembership);
+      if (idempMapKey) {
+        testTenantIdempotency.set(idempMapKey, {
+          tenant: tenantData,
+          branch: mainBranchData,
+          membership: ownerMembership,
+        });
+      }
     } else {
       const db = firestore();
-      const tenantRef = db.collection('tenants').doc(input.tenantId);
 
-      // Check if tenant ID already exists
-      const existingSnap = await tenantRef.get();
-      if (existingSnap.exists) {
-        throw new ConflictError(`Pharmacy with ID '${input.tenantId}' already exists.`);
+      if (idempotencyKey) {
+        const idempHash = crypto
+          .createHash('sha256')
+          .update(`${ownerId}:${idempotencyKey}`)
+          .digest('hex');
+        const idempRef = db.collection('users').doc(ownerId).collection('provision_keys').doc(idempHash);
+
+        const replayResult = await db.runTransaction(async (tx) => {
+          const idempSnap = await tx.get(idempRef);
+          if (idempSnap.exists) {
+            const existingTenantId = String(idempSnap.data()?.tenantId || '');
+            if (existingTenantId) {
+              const existingTenantRef = db.collection('tenants').doc(existingTenantId);
+              const [tSnap, bSnap, mSnap] = await Promise.all([
+                tx.get(existingTenantRef),
+                tx.get(existingTenantRef.collection('branches').doc('main')),
+                tx.get(existingTenantRef.collection('memberships').doc(ownerId)),
+              ]);
+              if (tSnap.exists && mSnap.exists) {
+                return {
+                  tenant: tSnap.data(),
+                  branch: bSnap.data(),
+                  membership: mSnap.data() as MembershipRecord,
+                  idempotentReplay: true,
+                };
+              }
+            }
+          }
+
+          const tenantRef = db.collection('tenants').doc(resolvedTenantId);
+          const existingSnap = await tx.get(tenantRef);
+          if (existingSnap.exists) {
+            throw new ConflictError(`Pharmacy with ID '${resolvedTenantId}' already exists.`);
+          }
+
+          tx.set(tenantRef, tenantData);
+          tx.set(tenantRef.collection('branches').doc('main'), mainBranchData);
+          tx.set(tenantRef.collection('memberships').doc(ownerId), ownerMembership);
+          tx.set(
+            db.collection('users').doc(ownerId),
+            {
+              uid: ownerId,
+              lastActiveTenantId: resolvedTenantId,
+              updatedAt: now,
+            },
+            { merge: true }
+          );
+          tx.set(idempRef, {
+            tenantId: resolvedTenantId,
+            createdAt: now,
+          });
+          return null;
+        });
+
+        if (replayResult) {
+          return replayResult;
+        }
+      } else {
+        const tenantRef = db.collection('tenants').doc(resolvedTenantId);
+        const existingSnap = await tenantRef.get();
+        if (existingSnap.exists) {
+          throw new ConflictError(`Pharmacy with ID '${resolvedTenantId}' already exists.`);
+        }
+
+        const batch = db.batch();
+        batch.set(tenantRef, tenantData);
+        batch.set(tenantRef.collection('branches').doc('main'), mainBranchData);
+        batch.set(tenantRef.collection('memberships').doc(ownerId), ownerMembership);
+
+        const userRef = db.collection('users').doc(ownerId);
+        batch.set(
+          userRef,
+          {
+            uid: ownerId,
+            lastActiveTenantId: resolvedTenantId,
+            updatedAt: now,
+          },
+          { merge: true }
+        );
+
+        await batch.commit();
       }
-
-      // Atomic batch write for tenant initialization
-      const batch = db.batch();
-      batch.set(tenantRef, tenantData);
-      batch.set(tenantRef.collection('branches').doc('main'), mainBranchData);
-      batch.set(tenantRef.collection('memberships').doc(ownerId), ownerMembership);
-
-      // Global user reference
-      const userRef = db.collection('users').doc(ownerId);
-      batch.set(
-        userRef,
-        {
-          uid: ownerId,
-          lastActiveTenantId: input.tenantId,
-          updatedAt: now,
-        },
-        { merge: true }
-      );
-
-      await batch.commit();
     }
 
     await AuditService.log({
-      tenantId: input.tenantId,
+      tenantId: resolvedTenantId,
       branchId: 'main',
       category: 'auth',
       severity: 'info',
@@ -208,12 +309,13 @@ export class TenantService {
       },
     });
 
-    logger.info({ tenantId: input.tenantId, ownerId }, 'Successfully provisioned new pharmacy tenant in Cloud Firestore');
+    logger.info({ tenantId: resolvedTenantId, ownerId }, 'Successfully provisioned new pharmacy tenant in Cloud Firestore');
 
     return {
       tenant: tenantData,
       branch: mainBranchData,
       membership: ownerMembership,
+      idempotentReplay: false,
     };
   }
 
@@ -421,6 +523,20 @@ export class TenantService {
     const doc = await membershipRef.get();
     if (!doc.exists) {
       throw new NotFoundError(`Employee membership '${targetUserId}' not found in this pharmacy.`);
+    }
+
+    const memberData = doc.data() as MembershipRecord;
+    if (memberData.role === 'owner' && memberData.status === 'active' && status !== 'active') {
+      const ownersSnap = await db
+        .collection('tenants')
+        .doc(tenantId)
+        .collection('memberships')
+        .where('role', '==', 'owner')
+        .where('status', '==', 'active')
+        .get();
+      if (ownersSnap.size <= 1) {
+        throw new BadRequestError('Cannot suspend or remove the last active pharmacy owner.');
+      }
     }
 
     const now = new Date().toISOString();

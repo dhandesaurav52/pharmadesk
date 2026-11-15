@@ -68,6 +68,11 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Joining code hash lookup index: Admin SDK only; never readable or writable by clients
+    match /joining_code_lookup/{codeHash} {
+      allow read, write: if false;
+    }
+
     // Global users collection: users can only read their own identity doc; mutations via backend API
     match /users/{userId} {
       allow read: if isUser(userId);

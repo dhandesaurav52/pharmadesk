@@ -74,6 +74,7 @@ import { customerApi, type ApiSessionConfig } from '../lib/customerApi.ts';
 import { procurementApi } from '../lib/procurementApi.ts';
 import {
   type ActiveTenantMembership,
+  type InactiveTenantMembership,
   mapApiCustomerToUi,
   mapApiTenantToStore,
   workspaceApi,
@@ -94,16 +95,20 @@ interface PharmacyContextType {
   store: PharmacyStore;
   updateStore: (updated: Partial<PharmacyStore>) => Promise<void> | void;
   currentUser: UserProfile;
-  switchUserRole: (role: UserRole) => void;
   usersList: UserProfile[];
   apiSession: ApiSessionConfig;
   setApiSession: (updated: Partial<ApiSessionConfig>) => void;
   firebaseSession: FirebaseAuthSessionInfo;
   memberships: ActiveTenantMembership[];
+  inactiveMemberships: InactiveTenantMembership[];
   workspaceLoading: boolean;
   workspaceError: string | null;
   setWorkspaceError: (err: string | null) => void;
-  refreshMemberships: () => Promise<ActiveTenantMembership[]>;
+  refreshMemberships: (overrides?: {
+    bearerToken?: string;
+    appCheckToken?: string | null;
+    preferredTenantId?: string;
+  }) => Promise<ActiveTenantMembership[]>;
   switchWorkspace: (tenantId: string) => Promise<void>;
   refreshLiveWorkspaceData: () => Promise<void>;
   signOutSession: () => Promise<void>;
@@ -327,7 +332,7 @@ interface PharmacyContextType {
     role: UserRole;
     assignedBranchIds: string[];
     permissionOverrides?: { granted?: string[]; revoked?: string[] };
-  }) => Promise<{ invitation: EmployeeInvitation; inviteLink: string }>;
+  }) => Promise<{ invitation: EmployeeInvitation; joiningCode: string; inviteLink: string }>;
   inviteEmployee: (invite: {
     email: string;
     name: string;
@@ -336,7 +341,9 @@ interface PharmacyContextType {
     assignedBranchIds: string[];
     permissionOverrides?: { granted?: string[]; revoked?: string[] };
   }) => EmployeeInvitation;
-  resendInvitation: (invitationId: string) => Promise<void> | void;
+  regenerateInvitation: (invitationId: string) => Promise<{ invitation: EmployeeInvitation; joiningCode: string }>;
+  resendInvitation: (invitationId: string) => Promise<{ invitation: EmployeeInvitation; joiningCode: string } | void>;
+  revokeInvitation: (invitationId: string) => Promise<void>;
   cancelInvitation: (invitationId: string) => Promise<void> | void;
   updateEmployeeRole: (userId: string, newRole: UserRole) => Promise<void> | void;
   updateEmployeeBranches: (userId: string, branches: string[]) => Promise<void> | void;
@@ -409,6 +416,7 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     };
   });
   const [memberships, setMemberships] = useState<ActiveTenantMembership[]>([]);
+  const [inactiveMemberships, setInactiveMemberships] = useState<InactiveTenantMembership[]>([]);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const lastHydratedTenantRef = React.useRef<string | null>(null);
@@ -436,6 +444,18 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       thermalPrinter: nextStore?.thermalPrinter ?? true,
       defaultDiscountPercent: nextStore?.defaultDiscountPercent ?? 0,
     });
+    if (!nextStore?.id) {
+      setCurrentUser({
+        id: '',
+        name: '',
+        email: '',
+        phone: '',
+        role: 'cashier',
+        storeId: '',
+        status: 'active',
+        assignedBranchIds: [],
+      });
+    }
     setBranches([]);
     setBranchAuditLogs([]);
     setStockTransfers([]);
@@ -460,27 +480,6 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     setPrintInvoiceData(null);
   }, []);
 
-  const restoreDevPreviewWorkspace = useCallback(() => {
-    setStore(INITIAL_STORE);
-    setCurrentUser(SAMPLE_USERS[0]);
-    setBranches(INITIAL_BRANCHES);
-    setActiveBranchId('main');
-    setConsolidatedViewMode(false);
-    setBranchAuditLogs([]);
-    setStockTransfers(INITIAL_STOCK_TRANSFERS);
-    setMedicines(INITIAL_MEDICINES);
-    setAllInventory(INITIAL_INVENTORY);
-    setCustomers(INITIAL_CUSTOMERS);
-    setSuppliers(INITIAL_SUPPLIERS);
-    setAllBills(INITIAL_BILLS);
-    setAllStockMovements(INITIAL_STOCK_MOVEMENTS);
-    setNotifications(INITIAL_NOTIFICATIONS);
-    setUsersList(SAMPLE_USERS);
-    setInvitationsList(INITIAL_INVITATIONS);
-    setPrintInvoiceData(null);
-    lastHydratedTenantRef.current = null;
-  }, []);
-
   const fetchMembershipsFromApi = useCallback(
     async (
       bearerToken: string,
@@ -500,8 +499,12 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       const rawMemberships: ActiveTenantMembership[] = Array.isArray(data.memberships)
         ? data.memberships
         : [];
+      const rawInactive: InactiveTenantMembership[] = Array.isArray(data.inactiveMemberships)
+        ? data.inactiveMemberships
+        : [];
       const activeList = rawMemberships.filter((m) => m.status === 'active');
       setMemberships(activeList);
+      setInactiveMemberships(rawInactive);
 
       const chosen =
         (preferredTenantId
@@ -549,24 +552,36 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     []
   );
 
-  const refreshMemberships = useCallback(async () => {
-    const refreshedUser = await reloadFirebaseUser().catch(() => null);
-    if (!apiSession.bearerToken) {
-      return [];
-    }
-    const list = await fetchMembershipsFromApi(
-      apiSession.bearerToken,
-      apiSession.appCheckToken,
-      apiSession.tenantId
-    );
-    if (refreshedUser) {
-      setFirebaseSession((prev) => ({
-        ...prev,
-        emailVerified: refreshedUser.emailVerified,
-      }));
-    }
-    return list;
-  }, [apiSession.appCheckToken, apiSession.bearerToken, apiSession.tenantId, fetchMembershipsFromApi]);
+  const refreshMemberships = useCallback(
+    async (overrides?: {
+      bearerToken?: string;
+      appCheckToken?: string | null;
+      preferredTenantId?: string;
+    }) => {
+      const refreshedUser = await reloadFirebaseUser().catch(() => null);
+      const token = overrides?.bearerToken || refreshedUser?.idToken || apiSession.bearerToken;
+      if (!token) {
+        return [];
+      }
+      const appCheck =
+        overrides?.appCheckToken !== undefined
+          ? overrides.appCheckToken
+          : apiSession.appCheckToken;
+      const list = await fetchMembershipsFromApi(
+        token,
+        appCheck,
+        overrides?.preferredTenantId || apiSession.tenantId
+      );
+      if (refreshedUser) {
+        setFirebaseSession((prev) => ({
+          ...prev,
+          emailVerified: refreshedUser.emailVerified,
+        }));
+      }
+      return list;
+    },
+    [apiSession.appCheckToken, apiSession.bearerToken, apiSession.tenantId, fetchMembershipsFromApi]
+  );
 
   const switchWorkspace = useCallback(
     async (tenantId: string) => {
@@ -611,15 +626,12 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           ...prev,
           bearerToken: null,
           appCheckToken: null,
-          tenantId: import.meta.env.PROD ? '' : INITIAL_STORE.id,
+          tenantId: '',
         }));
         setMemberships([]);
+        setInactiveMemberships([]);
         lastHydratedTenantRef.current = null;
-        if (import.meta.env.PROD) {
-          clearSampleWorkspaceData();
-        } else {
-          restoreDevPreviewWorkspace();
-        }
+        clearSampleWorkspaceData();
         setFirebaseSession({
           configured: status.configured,
           appCheckConfigured: status.appCheckConfigured,
@@ -662,7 +674,7 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     });
 
     return () => unsubscribe();
-  }, [clearSampleWorkspaceData, fetchMembershipsFromApi, restoreDevPreviewWorkspace]);
+  }, [clearSampleWorkspaceData, fetchMembershipsFromApi]);
 
   const signOutSession = useCallback(async () => {
     if (apiSession.bearerToken) {
@@ -678,19 +690,16 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
     await signOutClient();
     setMemberships([]);
+    setInactiveMemberships([]);
     lastHydratedTenantRef.current = null;
     setApiSessionState((prev) => ({
       ...prev,
       bearerToken: null,
       appCheckToken: null,
-      tenantId: import.meta.env.PROD ? '' : INITIAL_STORE.id,
+      tenantId: '',
     }));
-    if (import.meta.env.PROD) {
-      clearSampleWorkspaceData();
-    } else {
-      restoreDevPreviewWorkspace();
-    }
-  }, [apiSession.appCheckToken, apiSession.bearerToken, apiSession.tenantId, clearSampleWorkspaceData, restoreDevPreviewWorkspace]);
+    clearSampleWorkspaceData();
+  }, [apiSession.appCheckToken, apiSession.bearerToken, apiSession.tenantId, clearSampleWorkspaceData]);
 
   const [branches, setBranches] = useState<PharmacyBranch[]>(INITIAL_BRANCHES);
   const [activeBranchId, setActiveBranchId] = useState<string>('main');
@@ -1245,26 +1254,6 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       return;
     }
     setStore(prev => ({ ...prev, ...updated }));
-  };
-
-  const switchUserRole = (role: UserRole) => {
-    const targetUser = usersList.find(u => u.role === role) || SAMPLE_USERS.find(u => u.role === role) || SAMPLE_USERS[0];
-    setCurrentUser(targetUser);
-    if (
-      targetUser.role !== 'owner' &&
-      !targetUser.assignedBranchIds?.includes('*') &&
-      targetUser.assignedBranchIds &&
-      targetUser.assignedBranchIds.length > 0 &&
-      !targetUser.assignedBranchIds.includes(activeBranchId)
-    ) {
-      const firstBranch = branches.find(b => targetUser.assignedBranchIds?.includes(b.id)) || branches[0];
-      if (firstBranch) {
-        setConsolidatedViewMode(false);
-        setActiveBranchId(firstBranch.id);
-        setApiSessionState(prev => ({ ...prev, branchId: firstBranch.id }));
-        setStore(prev => ({ ...prev, branchName: firstBranch.name }));
-      }
-    }
   };
 
   const addMedicine = (med: Omit<MedicineMaster, 'id'>) => {
@@ -3259,33 +3248,14 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     role: UserRole;
     assignedBranchIds: string[];
     permissionOverrides?: { granted?: string[]; revoked?: string[] };
-  }): Promise<{ invitation: EmployeeInvitation; inviteLink: string }> => {
+  }): Promise<{ invitation: EmployeeInvitation; joiningCode: string; inviteLink: string }> => {
     if (apiSession.bearerToken && apiSession.tenantId) {
       const created = await workspaceApi.createInvitation(apiSession, invite);
       setInvitationsList(prev => [created.invitation, ...prev]);
       return created;
     }
 
-    const newInvite: EmployeeInvitation = {
-      id: `inv-${Date.now().toString(36)}`,
-      tenantId: store.id,
-      email: invite.email.trim().toLowerCase(),
-      name: invite.name.trim(),
-      phone: invite.phone?.trim() || null,
-      role: invite.role,
-      assignedBranchIds: invite.assignedBranchIds.length > 0 ? invite.assignedBranchIds : ['main'],
-      permissionOverrides: invite.permissionOverrides,
-      token: `inv_token_${Math.random().toString(36).substring(2, 10)}`,
-      status: 'pending',
-      expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(),
-      createdAt: new Date().toISOString(),
-      createdBy: currentUser.id,
-    };
-    setInvitationsList(prev => [newInvite, ...prev]);
-    return {
-      invitation: newInvite,
-      inviteLink: `/invite/${newInvite.token}?tenantId=${encodeURIComponent(store.id)}`,
-    };
+    throw new Error('Please sign in to an active pharmacy workspace before adding employees.');
   };
 
   const inviteEmployee = (invite: {
@@ -3305,7 +3275,6 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       role: invite.role,
       assignedBranchIds: invite.assignedBranchIds.length > 0 ? invite.assignedBranchIds : ['main'],
       permissionOverrides: invite.permissionOverrides,
-      token: `inv_token_${Math.random().toString(36).substring(2, 10)}`,
       status: 'pending',
       expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(),
       createdAt: new Date().toISOString(),
@@ -3325,24 +3294,28 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     return newInvite;
   };
 
-  const resendInvitation = async (invitationId: string) => {
-    if (apiSession.bearerToken && apiSession.tenantId) {
-      const { invitation } = await workspaceApi.resendInvitation(apiSession, invitationId);
-      setInvitationsList(prev => prev.map(inv => (inv.id === invitationId ? invitation : inv)));
-      return;
+  const regenerateInvitation = async (invitationId: string) => {
+    if (!apiSession.bearerToken || !apiSession.tenantId) {
+      throw new Error('Please sign in to an active pharmacy workspace.');
     }
-    setInvitationsList(prev =>
-      prev.map(inv =>
-        inv.id === invitationId
-          ? {
-              ...inv,
-              token: `inv_token_${Math.random().toString(36).substring(2, 10)}`,
-              expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(),
-              status: 'pending' as const,
-            }
-          : inv
-      )
-    );
+    const result = await workspaceApi.regenerateInvitation(apiSession, invitationId);
+    setInvitationsList(prev => prev.map(inv => (inv.id === invitationId ? result.invitation : inv)));
+    return {
+      invitation: result.invitation,
+      joiningCode: result.joiningCode,
+    };
+  };
+
+  const resendInvitation = async (invitationId: string) => {
+    return regenerateInvitation(invitationId);
+  };
+
+  const revokeInvitation = async (invitationId: string) => {
+    if (!apiSession.bearerToken || !apiSession.tenantId) {
+      throw new Error('Please sign in to an active pharmacy workspace.');
+    }
+    const revoked = await workspaceApi.revokeInvitation(apiSession, invitationId);
+    setInvitationsList(prev => prev.map(inv => (inv.id === invitationId ? revoked : inv)));
   };
 
   const cancelInvitation = async (invitationId: string) => {
@@ -4479,12 +4452,12 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         store,
         updateStore,
         currentUser,
-        switchUserRole,
         usersList,
         apiSession,
         setApiSession,
         firebaseSession,
         memberships,
+        inactiveMemberships,
         workspaceLoading,
         workspaceError,
         setWorkspaceError,
@@ -4577,7 +4550,9 @@ export const PharmacyProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         invitationsList,
         inviteEmployeeAsync,
         inviteEmployee,
+        regenerateInvitation,
         resendInvitation,
+        revokeInvitation,
         cancelInvitation,
         updateEmployeeRole,
         updateEmployeeBranches,

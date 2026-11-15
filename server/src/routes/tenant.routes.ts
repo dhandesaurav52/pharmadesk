@@ -17,7 +17,8 @@ const createTenantSchema = z.object({
     .string()
     .min(3, 'Tenant ID must be at least 3 characters')
     .max(64)
-    .regex(/^[a-z0-9-]+$/, 'Tenant ID must only contain lowercase alphanumeric characters and hyphens'),
+    .regex(/^[a-z0-9-]+$/, 'Tenant ID must only contain lowercase alphanumeric characters and hyphens')
+    .optional(),
   name: z.string().min(2, 'Pharmacy name must be at least 2 characters'),
   legalName: z.string().optional(),
   dlNumber20B: z.string().min(3, 'Drug License 20B is required'),
@@ -34,9 +35,11 @@ const createTenantSchema = z.object({
   invoicePrefix: z.string().min(2).max(10).optional(),
   thermalPrinter: z.boolean().optional(),
   defaultDiscountPercent: z.number().min(0).max(50).optional(),
+  idempotencyKey: z.string().min(4).max(128).optional(),
+  ownerName: z.string().min(2).max(120).optional(),
 });
 
-const updateTenantSchema = createTenantSchema.omit({ tenantId: true }).partial();
+const updateTenantSchema = createTenantSchema.omit({ tenantId: true, idempotencyKey: true, ownerName: true }).partial();
 
 /**
  * POST /api/v1/tenants
@@ -45,11 +48,19 @@ const updateTenantSchema = createTenantSchema.omit({ tenantId: true }).partial()
 tenantRouter.post(
   '/',
   asyncHandler(async (req: Request, res: Response) => {
+    if (!req.user!.emailVerified) {
+      throw new ForbiddenError('Please verify your email address before setting up your pharmacy.');
+    }
+
     const validatedData = createTenantSchema.parse(req.body);
     const ownerId = req.user!.uid;
+    const headerIdempotencyKey = (req.headers['x-idempotency-key'] as string | undefined)?.trim();
 
-    const result = await TenantService.createTenant(ownerId, validatedData);
-    res.status(201).json({
+    const result = await TenantService.createTenant(ownerId, {
+      ...validatedData,
+      idempotencyKey: validatedData.idempotencyKey || headerIdempotencyKey,
+    });
+    res.status(result.idempotentReplay ? 200 : 201).json({
       success: true,
       message: 'Pharmacy tenant successfully provisioned',
       data: result,

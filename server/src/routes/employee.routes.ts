@@ -19,6 +19,54 @@ employeeRouter.get('/permissions', (_req: Request, res: Response) => {
   });
 });
 
+const joiningCodeSchema = z.object({
+  joiningCode: z.string().trim().min(6, 'Please enter a valid joining code').max(32),
+});
+
+/**
+ * POST /api/v1/joining-codes/validate
+ * Public step-1 joining code check returning only safe preview details (no tenantId or full PII).
+ */
+employeeRouter.post(
+  '/joining-codes/validate',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { joiningCode } = joiningCodeSchema.parse(req.body);
+    const preview = await EmployeeService.validateJoiningCode({
+      joiningCode,
+      clientIp: req.ip || 'unknown',
+    });
+
+    res.status(200).json({
+      success: true,
+      data: preview,
+    });
+  })
+);
+
+/**
+ * POST /api/v1/joining-codes/redeem
+ * Redeems a single-use joining code for an authenticated, email-verified user.
+ */
+employeeRouter.post(
+  '/joining-codes/redeem',
+  firebaseAuthMiddleware,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { joiningCode } = joiningCodeSchema.parse(req.body);
+    const membership = await EmployeeService.redeemJoiningCode({
+      joiningCode,
+      userId: req.user!.uid,
+      userEmail: req.user!.email,
+      emailVerified: req.user!.emailVerified === true,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Welcome to the pharmacy. Your access has been activated.',
+      data: membership,
+    });
+  })
+);
+
 const acceptInvitationSchema = z.object({
   tenantId: z.string().min(3, 'Tenant ID is required'),
   token: z.string().min(16, 'Valid invitation token is required'),
@@ -146,16 +194,17 @@ employeeRouter.post(
 
     res.status(201).json({
       success: true,
-      message: 'Employee invitation created successfully',
+      message: 'Employee joining code created. Share this code privately with the employee.',
       data: invitation,
-      inviteLink: `/invite/${invitation.token}?tenantId=${tenantId}`,
+      joiningCode: invitation.joiningCode,
+      inviteLink: `/join-pharmacy`,
     });
   })
 );
 
 /**
  * GET /api/v1/tenants/:tenantId/invitations
- * Lists all pending, accepted, and expired invitations for this tenant.
+ * Lists all pending, accepted, expired, and revoked invitations for this tenant (secrets masked).
  */
 employeeRouter.get(
   '/tenants/:tenantId/invitations',
@@ -169,8 +218,36 @@ employeeRouter.get(
 );
 
 /**
+ * POST /api/v1/tenants/:tenantId/invitations/:invitationId/regenerate
+ * Invalidates any old joining code and generates a fresh single-use code with 72-hour expiry.
+ */
+employeeRouter.post(
+  '/tenants/:tenantId/invitations/:invitationId/regenerate',
+  ...tenantAuth,
+  requirePermission('employees.invite'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const { tenantId, userId: actingUserId } = req.tenantContext!;
+    const invitationId = req.params.invitationId!;
+
+    const updated = await EmployeeService.resendInvitation(
+      tenantId,
+      invitationId,
+      actingUserId
+    );
+
+    res.status(200).json({
+      success: true,
+      message: 'New employee joining code created. Share this code privately with the employee.',
+      data: updated,
+      joiningCode: updated.joiningCode,
+      inviteLink: `/join-pharmacy`,
+    });
+  })
+);
+
+/**
  * POST /api/v1/tenants/:tenantId/invitations/:invitationId/resend
- * Resends an invitation with refreshed token and expiration.
+ * Alias for regenerating an invitation with refreshed code/token and 72-hour window.
  */
 employeeRouter.post(
   '/tenants/:tenantId/invitations/:invitationId/resend',
@@ -188,9 +265,37 @@ employeeRouter.post(
 
     res.status(200).json({
       success: true,
-      message: 'Invitation resent successfully with new 72-hour window',
+      message: 'New employee joining code created. Share this code privately with the employee.',
       data: updated,
-      inviteLink: `/invite/${updated.token}?tenantId=${tenantId}`,
+      joiningCode: updated.joiningCode,
+      inviteLink: `/join-pharmacy`,
+    });
+  })
+);
+
+/**
+ * POST /api/v1/tenants/:tenantId/invitations/:invitationId/revoke
+ * Revokes an unused joining code immediately.
+ */
+employeeRouter.post(
+  '/tenants/:tenantId/invitations/:invitationId/revoke',
+  ...tenantAuth,
+  requirePermission('employees.invite'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const { tenantId, userId: actingUserId } = req.tenantContext!;
+    const invitationId = req.params.invitationId!;
+
+    const revoked = await EmployeeService.cancelInvitation(
+      tenantId,
+      invitationId,
+      actingUserId,
+      'revoked'
+    );
+
+    res.status(200).json({
+      success: true,
+      message: 'Joining code revoked successfully.',
+      data: revoked,
     });
   })
 );

@@ -128,9 +128,20 @@ export function createApp(options?: AppOptions): Express {
     },
   });
 
+  const joiningCodeLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: currentEnv.NODE_ENV === 'test' ? 200 : 25,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (_req: Request, _res: Response, next: NextFunction) => {
+      next(new RateLimitError('Too many joining code attempts. Please wait 15 minutes before trying again.'));
+    },
+  });
+
   // Apply general & targeted rate limiters
   app.use(currentEnv.API_PREFIX, limiter);
   app.use(`${currentEnv.API_PREFIX}/public/leads`, publicLeadLimiter);
+  app.use(`${currentEnv.API_PREFIX}/joining-codes`, joiningCodeLimiter);
   app.use(`${currentEnv.API_PREFIX}/auth`, sensitiveLimiter);
   app.use(`${currentEnv.API_PREFIX}/invitations`, sensitiveLimiter);
   app.use(`${currentEnv.API_PREFIX}/tenants/:tenantId/invitations`, sensitiveLimiter);

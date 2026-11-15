@@ -11,6 +11,7 @@ export type MarketingRoutePath =
   | '/contact'
   | '/privacy'
   | '/terms'
+  | '/join-pharmacy'
   | '/app';
 
 export interface PageSeoMeta {
@@ -54,6 +55,12 @@ export const PAGE_SEO_MAP: Record<MarketingRoutePath, PageSeoMeta> = {
     title: 'Terms & Conditions | PharmaDesk',
     description:
       'Service terms and usage guidelines for the PharmaDesk cloud pharmacy management platform.',
+  },
+  '/join-pharmacy': {
+    title: 'Join Your Pharmacy – Employee Onboarding | PharmaDesk',
+    description:
+      'Enter the joining code provided by your pharmacy owner to create your staff account or sign in and enter your pharmacy workspace.',
+    robots: 'noindex, nofollow',
   },
   '/app': {
     title: 'PharmaDesk Workspace – Pharmacy Operations Console',

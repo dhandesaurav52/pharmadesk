@@ -22,6 +22,14 @@ export interface UserProfile {
   };
 }
 
+export type StaffInviteDisplayStatus =
+  | 'Invitation Ready'
+  | 'Awaiting Account Setup'
+  | 'Active'
+  | 'Suspended'
+  | 'Invitation Expired'
+  | 'Invitation Revoked';
+
 export interface EmployeeInvitation {
   id: string;
   tenantId: string;
@@ -34,7 +42,11 @@ export interface EmployeeInvitation {
     granted?: string[];
     revoked?: string[];
   };
-  token: string;
+  token?: string;
+  joiningCode?: string;
+  codeLast4?: string;
+  joiningCodeMasked?: string;
+  displayStatus?: StaffInviteDisplayStatus;
   status: 'pending' | 'accepted' | 'expired' | 'cancelled' | 'revoked';
   expiresAt: string;
   createdAt: string;

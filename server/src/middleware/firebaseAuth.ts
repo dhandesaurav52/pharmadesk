@@ -56,10 +56,11 @@ export async function firebaseAuthMiddleware(
       const parts = idToken.split(':');
       const uid = parts[1] || 'test-user-uid';
       const email = parts[2] || `${uid}@pharmadesk.test`;
+      const emailVerified = parts[3] !== 'unverified';
       req.user = {
         uid,
         email,
-        emailVerified: true,
+        emailVerified,
       };
       return next();
     }
