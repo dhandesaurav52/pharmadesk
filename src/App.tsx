@@ -19,6 +19,7 @@ import { AddMedicineModal } from './components/modals/AddMedicineModal.tsx';
 import { AddCustomerModal } from './components/modals/AddCustomerModal.tsx';
 import { AddStockModal } from './components/modals/AddStockModal.tsx';
 import { PrintInvoiceModal } from './components/modals/PrintInvoiceModal.tsx';
+import { WorkspaceOnboardingView } from './components/modals/WorkspaceOnboardingView.tsx';
 
 // Code-split authenticated workspace views (keeps initial marketing & POS load light)
 const DashboardView = lazy(() =>
@@ -87,7 +88,29 @@ const LegalPage = lazy(() =>
   import('./pages/marketing/LegalPage.tsx').then((m) => ({ default: m.LegalPage }))
 );
 
+function parseInviteParams(pathname: string, search: string): { token: string; tenantId?: string } | null {
+  const qs = new URLSearchParams(search);
+  const match = pathname.match(/^\/invite\/([^/]+)/);
+  if (match && match[1]) {
+    return {
+      token: decodeURIComponent(match[1]),
+      tenantId: qs.get('tenantId') || undefined,
+    };
+  }
+  const queryToken = qs.get('token');
+  if (pathname.startsWith('/invite') && queryToken) {
+    return {
+      token: queryToken,
+      tenantId: qs.get('tenantId') || undefined,
+    };
+  }
+  return null;
+}
+
 function normalizeRoutePath(pathname: string): MarketingRoutePath {
+  if (pathname.startsWith('/invite')) {
+    return '/app';
+  }
   const clean = pathname.replace(/\/+$/, '') || '/';
   switch (clean) {
     case '/':
@@ -112,7 +135,7 @@ function normalizeRoutePath(pathname: string): MarketingRoutePath {
 }
 
 const MainLayout: React.FC<{ onReturnToSite: () => void }> = ({ onReturnToSite }) => {
-  const { activeModule, activeBranch, consolidatedViewMode } = usePharmacy();
+  const { activeModule, activeBranch, consolidatedViewMode, workspaceError, setWorkspaceError } = usePharmacy();
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
 
@@ -171,6 +194,21 @@ const MainLayout: React.FC<{ onReturnToSite: () => void }> = ({ onReturnToSite }
 
           {/* Main Content View */}
           <main className="flex-1 p-4 lg:p-6 max-w-7xl w-full mx-auto pb-24 lg:pb-12">
+            {workspaceError && (
+              <div className="mb-4 bg-red-50 border border-red-200 rounded-xl px-4 py-3 flex items-center justify-between gap-3 text-xs text-red-900">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+                  <span>{workspaceError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setWorkspaceError(null)}
+                  className="text-red-700 font-semibold hover:underline shrink-0"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
             {!consolidatedViewMode && activeBranch && activeBranch.status !== 'ACTIVE' && (
               <div className="mb-4 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 flex items-start gap-3 text-xs text-amber-900">
                 <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
@@ -218,13 +256,24 @@ const MainLayout: React.FC<{ onReturnToSite: () => void }> = ({ onReturnToSite }
 };
 
 const AppShell: React.FC = () => {
-  const { firebaseSession, setIsLoginModalOpen } = usePharmacy();
+  const { firebaseSession, memberships, setIsLoginModalOpen } = usePharmacy();
+  const [pendingInvite] = useState<{ token: string; tenantId?: string } | null>(() =>
+    typeof window !== 'undefined'
+      ? parseInviteParams(window.location.pathname, window.location.search)
+      : null
+  );
   const [route, setRoute] = useState<MarketingRoutePath>(() =>
     typeof window !== 'undefined' ? normalizeRoutePath(window.location.pathname) : '/'
   );
   const [contactInquiryType, setContactInquiryType] = useState<PublicInquiryType>('BOOK_DEMO');
 
   usePageSeo(route);
+
+  useEffect(() => {
+    if (pendingInvite && typeof window !== 'undefined' && window.location.pathname.startsWith('/invite')) {
+      window.history.replaceState({}, '', '/app');
+    }
+  }, [pendingInvite]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -288,11 +337,21 @@ const AppShell: React.FC = () => {
 
   const isProdWorkspaceLocked =
     route === '/app' && import.meta.env.PROD && !firebaseSession.authenticated;
+  const needsWorkspaceOnboarding =
+    route === '/app' && firebaseSession.authenticated && memberships.length === 0;
 
   return (
     <>
       {route === '/app' ? (
-        isProdWorkspaceLocked ? (
+        firebaseSession.authLoading ? (
+          <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+            <div className="bg-white border border-slate-200 rounded-2xl p-8 max-w-sm w-full text-center space-y-2 shadow-xs">
+              <div className="w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto" />
+              <p className="text-sm font-semibold text-slate-900">Verifying pharmacy session...</p>
+              <p className="text-xs text-slate-500">Checking Firebase authentication and store access.</p>
+            </div>
+          </div>
+        ) : isProdWorkspaceLocked ? (
           <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
             <div className="max-w-md w-full bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 space-y-5 text-center shadow-xs">
               <div className="w-12 h-12 rounded-xl bg-blue-50 border border-blue-100 text-blue-700 flex items-center justify-center mx-auto">
@@ -303,8 +362,9 @@ const AppShell: React.FC = () => {
                   Sign In to PharmaDesk Workspace
                 </h1>
                 <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
-                  Staff authentication via Firebase Authentication is required to access your
-                  pharmacy&apos;s billing, stock, and accounting workspace.
+                  {pendingInvite
+                    ? 'Sign in or create a staff account with Firebase Authentication to accept your pharmacy invitation.'
+                    : 'Staff authentication via Firebase Authentication is required to access your pharmacy\'s billing, stock, and accounting workspace.'}
                 </p>
               </div>
               <div className="flex flex-col gap-2.5">
@@ -326,6 +386,12 @@ const AppShell: React.FC = () => {
               </div>
             </div>
           </div>
+        ) : needsWorkspaceOnboarding ? (
+          <WorkspaceOnboardingView
+            initialInviteToken={pendingInvite?.token}
+            initialInviteTenantId={pendingInvite?.tenantId}
+            onReturnToSite={() => navigateTo('/')}
+          />
         ) : (
           <MainLayout onReturnToSite={() => navigateTo('/')} />
         )

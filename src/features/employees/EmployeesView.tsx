@@ -262,11 +262,12 @@ const ROLE_INFO: Record<UserRole, { title: string; badgeColor: string; descripti
 
 export const EmployeesView: React.FC = () => {
   const {
+    store,
     currentUser,
     usersList,
     invitationsList,
     branches,
-    inviteEmployee,
+    inviteEmployeeAsync,
     resendInvitation,
     cancelInvitation,
     updateEmployeeRole,
@@ -288,6 +289,8 @@ export const EmployeesView: React.FC = () => {
   const [editingEmployee, setEditingEmployee] = useState<UserProfile | null>(null);
   const [copiedToken, setCopiedToken] = useState<string | null>(null);
   const [generatedInviteLink, setGeneratedInviteLink] = useState<string | null>(null);
+  const [staffActionError, setStaffActionError] = useState<string | null>(null);
+  const [staffSubmitting, setStaffSubmitting] = useState(false);
 
   // Invite Form State
   const [inviteName, setInviteName] = useState('');
@@ -353,58 +356,83 @@ export const EmployeesView: React.FC = () => {
   };
 
   // Submit Edit Employee
-  const handleSaveEmployee = (e: React.FormEvent) => {
+  const handleSaveEmployee = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingEmployee) return;
-
-    if (editRole !== editingEmployee.role) {
-      updateEmployeeRole(editingEmployee.id, editRole);
+    setStaffActionError(null);
+    setStaffSubmitting(true);
+    try {
+      if (editRole !== editingEmployee.role) {
+        await Promise.resolve(updateEmployeeRole(editingEmployee.id, editRole));
+      }
+      await Promise.resolve(updateEmployeeBranches(editingEmployee.id, editBranches));
+      await Promise.resolve(
+        updateEmployeePermissions(editingEmployee.id, {
+          granted: editGrantedPerms,
+          revoked: editRevokedPerms,
+        })
+      );
+      setEditingEmployee(null);
+    } catch (err) {
+      setStaffActionError(err instanceof Error ? err.message : 'Failed to update employee permissions.');
+    } finally {
+      setStaffSubmitting(false);
     }
-    updateEmployeeBranches(editingEmployee.id, editBranches);
-    updateEmployeePermissions(editingEmployee.id, {
-      granted: editGrantedPerms,
-      revoked: editRevokedPerms,
-    });
-
-    setEditingEmployee(null);
   };
 
   // Toggle status
-  const handleStatusChange = (status: 'active' | 'suspended' | 'deactivated') => {
+  const handleStatusChange = async (status: 'active' | 'suspended' | 'deactivated') => {
     if (!editingEmployee) return;
-    updateEmployeeStatus(editingEmployee.id, status);
-    setEditingEmployee({ ...editingEmployee, status });
-    setShowDeactivateConfirm(false);
+    setStaffActionError(null);
+    setStaffSubmitting(true);
+    try {
+      await Promise.resolve(updateEmployeeStatus(editingEmployee.id, status));
+      setEditingEmployee({ ...editingEmployee, status });
+      setShowDeactivateConfirm(false);
+    } catch (err) {
+      setStaffActionError(err instanceof Error ? err.message : 'Failed to change employee status.');
+    } finally {
+      setStaffSubmitting(false);
+    }
   };
 
   // Submit Invite
-  const handleCreateInvite = (e: React.FormEvent) => {
+  const handleCreateInvite = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inviteEmail || !inviteName) return;
+    setStaffActionError(null);
+    setStaffSubmitting(true);
+    try {
+      const { inviteLink } = await inviteEmployeeAsync({
+        email: inviteEmail.trim(),
+        name: inviteName.trim(),
+        phone: invitePhone.trim() || undefined,
+        role: inviteRole,
+        assignedBranchIds: inviteBranches,
+        permissionOverrides:
+          inviteGrantedPerms.length > 0 || inviteRevokedPerms.length > 0
+            ? { granted: inviteGrantedPerms, revoked: inviteRevokedPerms }
+            : undefined,
+      });
 
-    const newInvite = inviteEmployee({
-      email: inviteEmail.trim(),
-      name: inviteName.trim(),
-      phone: invitePhone.trim() || undefined,
-      role: inviteRole,
-      assignedBranchIds: inviteBranches,
-      permissionOverrides: (inviteGrantedPerms.length > 0 || inviteRevokedPerms.length > 0)
-        ? { granted: inviteGrantedPerms, revoked: inviteRevokedPerms }
-        : undefined,
-    });
+      const origin = typeof window !== 'undefined' ? window.location.origin : '';
+      const fullLink = inviteLink.startsWith('http') ? inviteLink : `${origin}${inviteLink}`;
+      setGeneratedInviteLink(fullLink);
 
-    const link = `https://pharmadesk.app/invite?token=${newInvite.token}`;
-    setGeneratedInviteLink(link);
-
-    // Reset fields
-    setInviteName('');
-    setInviteEmail('');
-    setInvitePhone('');
-    setInviteRole('pharmacist');
-    setInviteBranches(['main']);
-    setInviteGrantedPerms([]);
-    setInviteRevokedPerms([]);
-    setShowInvitePermOverrides(false);
+      // Reset fields
+      setInviteName('');
+      setInviteEmail('');
+      setInvitePhone('');
+      setInviteRole('pharmacist');
+      setInviteBranches(['main']);
+      setInviteGrantedPerms([]);
+      setInviteRevokedPerms([]);
+      setShowInvitePermOverrides(false);
+    } catch (err) {
+      setStaffActionError(err instanceof Error ? err.message : 'Failed to send invitation.');
+    } finally {
+      setStaffSubmitting(false);
+    }
   };
 
   const handleCopyLink = (text: string, id: string) => {
@@ -450,6 +478,22 @@ export const EmployeesView: React.FC = () => {
           </button>
         )}
       </div>
+
+      {staffActionError && (
+        <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-800 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+            <span>{staffActionError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setStaffActionError(null)}
+            className="text-red-700 font-semibold hover:underline shrink-0"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* KPI Metrics Ribbon */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
@@ -773,8 +817,9 @@ export const EmployeesView: React.FC = () => {
                     const hoursLeft = Math.round((expiresAtDate.getTime() - now.getTime()) / (1000 * 60 * 60));
                     const isExpired = hoursLeft <= 0 || inv.status === 'expired';
                     const isTokenRedacted = !inv.token || inv.token.startsWith('***');
+                    const origin = typeof window !== 'undefined' ? window.location.origin : '';
                     const inviteLink = !isTokenRedacted
-                      ? `https://pharmadesk.app/invite?token=${inv.token}`
+                      ? `${origin}/invite/${encodeURIComponent(inv.token)}?tenantId=${encodeURIComponent(inv.tenantId || store.id)}`
                       : '';
 
                     return (
@@ -887,7 +932,16 @@ export const EmployeesView: React.FC = () => {
                                 )}
 
                                 <button
-                                  onClick={() => resendInvitation(inv.id)}
+                                  onClick={async () => {
+                                    setStaffActionError(null);
+                                    try {
+                                      await Promise.resolve(resendInvitation(inv.id));
+                                    } catch (err) {
+                                      setStaffActionError(
+                                        err instanceof Error ? err.message : 'Failed to resend invitation.'
+                                      );
+                                    }
+                                  }}
                                   className="p-1.5 text-slate-600 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors border border-slate-200 cursor-pointer"
                                   title="Resend Invitation (Resets 72h TTL)"
                                 >
@@ -895,7 +949,16 @@ export const EmployeesView: React.FC = () => {
                                 </button>
 
                                 <button
-                                  onClick={() => cancelInvitation(inv.id)}
+                                  onClick={async () => {
+                                    setStaffActionError(null);
+                                    try {
+                                      await Promise.resolve(cancelInvitation(inv.id));
+                                    } catch (err) {
+                                      setStaffActionError(
+                                        err instanceof Error ? err.message : 'Failed to cancel invitation.'
+                                      );
+                                    }
+                                  }}
                                   className="p-1.5 text-slate-600 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors border border-slate-200 cursor-pointer"
                                   title="Cancel Invitation"
                                 >
@@ -1294,9 +1357,10 @@ export const EmployeesView: React.FC = () => {
                   </button>
                   <button
                     type="submit"
-                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold shadow-xs cursor-pointer"
+                    disabled={staffSubmitting}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-xs font-semibold shadow-xs cursor-pointer"
                   >
-                    Create & Generate 72h Invite
+                    {staffSubmitting ? 'Creating Invite...' : 'Create & Generate 72h Invite'}
                   </button>
                 </div>
               </form>
@@ -1540,9 +1604,10 @@ export const EmployeesView: React.FC = () => {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold shadow-xs cursor-pointer"
+                  disabled={staffSubmitting}
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-xs font-semibold shadow-xs cursor-pointer"
                 >
-                  Save Changes
+                  {staffSubmitting ? 'Saving...' : 'Save Changes'}
                 </button>
               </div>
             </form>

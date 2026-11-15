@@ -102,6 +102,7 @@ export const procurementApi = {
     if (params.search) qs.set('search', params.search);
     if (params.status) qs.set('status', params.status);
     if (params.includeArchived) qs.set('includeArchived', 'true');
+    qs.set('limit', '100');
     const res = await procurementRequest<{ success: boolean; data: { suppliers: any[]; total: number } }>(
       session,
       `/api/v1/suppliers?${qs.toString()}`
@@ -143,6 +144,19 @@ export const procurementApi = {
     return mapApiSupplierToUi(res.data.supplier);
   },
 
+  async updateSupplier(
+    session: ApiSessionConfig,
+    supplierId: string,
+    payload: Record<string, unknown>
+  ) {
+    const res = await procurementRequest<{ success: boolean; data: { supplier: any } }>(
+      session,
+      `/api/v1/suppliers/${encodeURIComponent(supplierId)}`,
+      { method: 'PATCH', body: JSON.stringify(payload) }
+    );
+    return mapApiSupplierToUi(res.data.supplier);
+  },
+
   async updateSupplierStatus(
     session: ApiSessionConfig,
     supplierId: string,
@@ -157,6 +171,15 @@ export const procurementApi = {
     return mapApiSupplierToUi(res.data.supplier);
   },
 
+  async archiveSupplier(session: ApiSessionConfig, supplierId: string, reason?: string) {
+    const res = await procurementRequest<{ success: boolean; data: { supplier: any } }>(
+      session,
+      `/api/v1/suppliers/${encodeURIComponent(supplierId)}/archive`,
+      { method: 'POST', body: JSON.stringify({ reason }) }
+    );
+    return mapApiSupplierToUi(res.data.supplier);
+  },
+
   async getSupplierStatement(session: ApiSessionConfig, supplierId: string) {
     const res = await procurementRequest<{
       success: boolean;
@@ -166,7 +189,7 @@ export const procurementApi = {
   },
 
   async listPurchaseOrders(session: ApiSessionConfig, status?: PurchaseOrderStatus) {
-    const qs = status ? `?status=${status}` : '';
+    const qs = status ? `?status=${status}&limit=100` : '?limit=100';
     const res = await procurementRequest<{ success: boolean; data: { purchaseOrders: PurchaseOrder[] } }>(
       session,
       `/api/v1/purchase-orders${qs}`
@@ -179,6 +202,15 @@ export const procurementApi = {
       session,
       '/api/v1/purchase-orders',
       { method: 'POST', body: JSON.stringify(payload) }
+    );
+    return res.data.purchaseOrder;
+  },
+
+  async submitPurchaseOrder(session: ApiSessionConfig, poId: string) {
+    const res = await procurementRequest<{ success: boolean; data: { purchaseOrder: PurchaseOrder } }>(
+      session,
+      `/api/v1/purchase-orders/${encodeURIComponent(poId)}/submit`,
+      { method: 'POST' }
     );
     return res.data.purchaseOrder;
   },
@@ -201,10 +233,19 @@ export const procurementApi = {
     return res.data.purchaseOrder;
   },
 
+  async closePurchaseOrder(session: ApiSessionConfig, poId: string, reason?: string) {
+    const res = await procurementRequest<{ success: boolean; data: { purchaseOrder: PurchaseOrder } }>(
+      session,
+      `/api/v1/purchase-orders/${encodeURIComponent(poId)}/close`,
+      { method: 'POST', body: JSON.stringify({ reason }) }
+    );
+    return res.data.purchaseOrder;
+  },
+
   async listGrns(session: ApiSessionConfig) {
     const res = await procurementRequest<{ success: boolean; data: { goodsReceipts: GoodsReceiptNote[] } }>(
       session,
-      '/api/v1/goods-receipts'
+      '/api/v1/goods-receipts?limit=100'
     );
     return res.data.goodsReceipts;
   },
@@ -231,7 +272,7 @@ export const procurementApi = {
   },
 
   async listSupplierInvoices(session: ApiSessionConfig, supplierId?: string) {
-    const qs = supplierId ? `?supplierId=${supplierId}` : '';
+    const qs = supplierId ? `?supplierId=${supplierId}&limit=100` : '?limit=100';
     const res = await procurementRequest<{ success: boolean; data: { invoices: SupplierInvoice[] } }>(
       session,
       `/api/v1/supplier-invoices${qs}`

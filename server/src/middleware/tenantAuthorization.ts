@@ -103,6 +103,16 @@ export function getTestMemberships(tenantId: string): MembershipRecord[] {
   return result;
 }
 
+export function getAllTestMembershipsForUser(userId: string): MembershipRecord[] {
+  const result: MembershipRecord[] = [];
+  for (const val of testMembershipStore.values()) {
+    if (val.userId === userId) {
+      result.push(val);
+    }
+  }
+  return result;
+}
+
 /**
  * Tenant Authorization Middleware:
  * Enforces strict multi-tenant isolation by verifying the caller's active membership

@@ -3,13 +3,22 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useRef } from 'react';
-import { X, Printer, CheckCircle, Share2 } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { X, Printer, AlertTriangle } from 'lucide-react';
 import { usePharmacy } from '../../context/PharmacyContext.tsx';
 
 export const PrintInvoiceModal: React.FC = () => {
   const { printInvoiceData, setPrintInvoiceData, store, hasUserPermission } = usePharmacy();
   const printAreaRef = useRef<HTMLDivElement>(null);
+  const [paperMode, setPaperMode] = useState<'thermal' | 'a4'>(
+    store.thermalPrinter ? 'thermal' : 'a4'
+  );
+  const [printError, setPrintError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setPaperMode(store.thermalPrinter ? 'thermal' : 'a4');
+    setPrintError(null);
+  }, [printInvoiceData, store.thermalPrinter]);
 
   if (!printInvoiceData) return null;
 
@@ -22,32 +31,71 @@ export const PrintInvoiceModal: React.FC = () => {
   };
 
   const handlePrint = () => {
-    window.print();
+    setPrintError(null);
+    try {
+      if (typeof window.print !== 'function') {
+        setPrintError('Browser print dialog is not supported on this device. Connect a receipt printer or use Chrome/Edge desktop.');
+        return;
+      }
+      window.print();
+    } catch (err: any) {
+      setPrintError(
+        err?.message || 'Unable to open system print dialog. Check browser popup/print permissions.'
+      );
+    }
   };
 
   const invoice = printInvoiceData;
+  const isThermal = paperMode === 'thermal';
+  const missingComplianceInfo = !store.dlNumber20B || !store.dlNumber21B;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs overflow-y-auto print:p-0 print:bg-white">
-      <div className="bg-white rounded-2xl max-w-lg w-full shadow-2xl border border-slate-200 overflow-hidden my-4 print:border-none print:shadow-none print:max-w-none print:w-full print:m-0">
+      <div
+        className={`bg-white rounded-2xl w-full shadow-2xl border border-slate-200 overflow-hidden my-4 print:border-none print:shadow-none print:max-w-none print:m-0 ${
+          isThermal ? 'max-w-[360px] print:w-[80mm]' : 'max-w-2xl print:w-full'
+        }`}
+      >
         {/* Modal Top Actions (Hidden in print) */}
-        <div className="px-6 py-3.5 border-b border-slate-200 flex items-center justify-between bg-slate-50 print:hidden">
+        <div className="px-4 sm:px-6 py-3.5 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 bg-slate-50 print:hidden">
           <div className="flex items-center gap-2">
             <Printer className="w-4 h-4 text-blue-600" />
             <span className="text-xs font-bold text-slate-800">
-              Tax Invoice Preview • {invoice.invoiceNumber}
+              {invoice.invoiceNumber}
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
+            <div className="inline-flex rounded-lg bg-slate-200/70 p-0.5 text-[11px] font-semibold">
+              <button
+                type="button"
+                onClick={() => setPaperMode('thermal')}
+                className={`px-2 py-1 rounded-md transition-colors ${
+                  isThermal ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                }`}
+              >
+                80mm Roll
+              </button>
+              <button
+                type="button"
+                onClick={() => setPaperMode('a4')}
+                className={`px-2 py-1 rounded-md transition-colors ${
+                  !isThermal ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                }`}
+              >
+                A4 GST
+              </button>
+            </div>
             <button
+              type="button"
               onClick={handlePrint}
               className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow-xs"
             >
               <Printer className="w-3.5 h-3.5" />
-              <span>Print Invoice</span>
+              <span>Print</span>
             </button>
             <button
+              type="button"
               onClick={() => setPrintInvoiceData(null)}
               className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-200"
             >
@@ -56,8 +104,23 @@ export const PrintInvoiceModal: React.FC = () => {
           </div>
         </div>
 
+        {(printError || missingComplianceInfo) && (
+          <div className="px-4 py-2.5 bg-amber-50 border-b border-amber-200 text-[11px] text-amber-900 flex items-start gap-2 print:hidden">
+            <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+            <span>
+              {printError ||
+                'Add Drug License 20B & 21B numbers in Store Setup so receipts comply with retail pharmacy rules.'}
+            </span>
+          </div>
+        )}
+
         {/* Printable Invoice Container */}
-        <div ref={printAreaRef} className="p-6 text-slate-900 font-sans text-xs bg-white">
+        <div
+          ref={printAreaRef}
+          className={`text-slate-900 font-sans bg-white ${
+            isThermal ? 'p-4 text-[11px] print:p-2 print:text-[10px]' : 'p-6 text-xs'
+          }`}
+        >
           {/* Pharmacy Header */}
           <div className="text-center border-b border-dashed border-slate-300 pb-3 mb-3">
             <h2 className="text-base font-bold uppercase tracking-tight text-slate-900">
@@ -67,13 +130,13 @@ export const PrintInvoiceModal: React.FC = () => {
               {store.address}, {store.city} - {store.pincode}
             </p>
             <p className="text-[10px] text-slate-500 font-mono mt-0.5">
-              Ph: {store.phone} | GSTIN: {store.gstin}
+              Ph: {store.phone} | GSTIN: {store.gstin || 'Unregistered / Composition'}
             </p>
             <p className="text-[10px] text-slate-500 font-mono">
-              DL 20B: {store.dlNumber20B} | DL 21B: {store.dlNumber21B}
+              DL 20B: {store.dlNumber20B || 'Pending'} | DL 21B: {store.dlNumber21B || 'Pending'}
             </p>
             <div className="mt-1 text-[11px] font-bold text-slate-800 uppercase tracking-wider">
-              RETAIL PHARMACY TAX INVOICE
+              {isThermal ? 'RETAIL TAX RECEIPT' : 'RETAIL PHARMACY TAX INVOICE (CUSTOMER COPY)'}
             </div>
           </div>
 

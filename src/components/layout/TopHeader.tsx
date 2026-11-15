@@ -50,6 +50,8 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
     setConsolidatedViewMode,
     hasUserPermission,
     firebaseSession,
+    memberships,
+    switchWorkspace,
     signOutSession,
   } = usePharmacy();
 
@@ -127,6 +129,37 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
 
           {isStoreMenuOpen && (
             <div className="absolute left-0 mt-1.5 w-80 bg-white rounded-xl shadow-lg border border-slate-200 py-2 z-50">
+              {memberships.length > 1 && (
+                <div className="px-3 pb-2 mb-2 border-b border-slate-100">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 block mb-1.5">
+                    Pharmacy Workspaces ({memberships.length})
+                  </span>
+                  <div className="space-y-1 max-h-32 overflow-y-auto">
+                    {memberships.map((m) => {
+                      const activeTenant = m.tenantId === store.id;
+                      return (
+                        <button
+                          key={m.tenantId}
+                          type="button"
+                          onClick={() => {
+                            void switchWorkspace(m.tenantId);
+                            setIsStoreMenuOpen(false);
+                          }}
+                          className={`w-full px-2.5 py-1.5 rounded-lg text-left text-xs flex items-center justify-between transition-colors ${
+                            activeTenant
+                              ? 'bg-blue-50 text-blue-700 font-semibold'
+                              : 'text-slate-700 hover:bg-slate-50'
+                          }`}
+                        >
+                          <span className="truncate">{m.tenantName || m.tenantId}</span>
+                          <span className="text-[10px] font-mono uppercase text-slate-500">{m.role}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               <div className="px-3 pb-2 border-b border-slate-100 flex items-center justify-between">
                 <span className="text-xs font-semibold text-slate-600">
                   Active Branch Workspace ({authorizedBranches.length})

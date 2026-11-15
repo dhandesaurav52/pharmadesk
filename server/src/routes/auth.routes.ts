@@ -4,6 +4,7 @@ import { asyncHandler } from '../lib/asyncHandler';
 import { adminAuth, firestore } from '../lib/firebaseAdmin';
 import { logger } from '../lib/logger';
 import { AuditService } from '../services/auditService';
+import { getAllTestMembershipsForUser } from '../middleware/tenantAuthorization';
 
 export const authRouter = Router();
 
@@ -18,22 +19,32 @@ authRouter.get(
   '/me',
   asyncHandler(async (req: Request, res: Response) => {
     const user = req.user!;
-    const db = firestore();
+    const isTestEnv = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
 
     // Query memberships for this user across collection group 'memberships'
     const memberships: any[] = [];
-    try {
-      const snap = await db
-        .collectionGroup('memberships')
-        .where('userId', '==', user.uid)
-        .where('status', '==', 'active')
-        .get();
+    if (isTestEnv) {
+      memberships.push(
+        ...getAllTestMembershipsForUser(user.uid).filter((m) => m.status === 'active')
+      );
+    } else {
+      const db = firestore();
+      try {
+        const snap = await db
+          .collectionGroup('memberships')
+          .where('userId', '==', user.uid)
+          .where('status', '==', 'active')
+          .get();
 
-      snap.forEach((doc) => {
-        memberships.push(doc.data());
-      });
-    } catch (_err) {
-      // In tests or if indexes pending, fallback gracefully
+        snap.forEach((doc) => {
+          memberships.push(doc.data());
+        });
+      } catch (err: any) {
+        logger.warn(
+          { requestId: req.id, uid: user.uid, err: err?.message },
+          'Failed to query memberships collectionGroup in /auth/me'
+        );
+      }
     }
 
     res.status(200).json({

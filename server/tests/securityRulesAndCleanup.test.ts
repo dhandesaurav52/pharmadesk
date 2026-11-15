@@ -379,6 +379,19 @@ describe('Phase 6 Security Policy Verification & PostgreSQL Cleanup Guard', () =
     const leadsIdx = rules.indexOf('match /marketing_leads/{leadId}');
     expect(leadsIdx).toBeGreaterThan(-1);
     expect(rules.slice(leadsIdx, leadsIdx + 120)).toContain('allow read, write: if false;');
+
+    const indexes = JSON.parse(fs.readFileSync(path.join(repoRoot, 'firestore.indexes.json'), 'utf-8')).indexes as Array<{
+      collectionGroup: string;
+      queryScope?: string;
+      fields: Array<{ fieldPath: string; order: string }>;
+    }>;
+    const hasMembershipsGroupIndex = indexes.some(
+      (idx) =>
+        idx.collectionGroup === 'memberships' &&
+        idx.queryScope === 'COLLECTION_GROUP' &&
+        idx.fields.map((f) => `${f.fieldPath}:${f.order}`).join(',') === 'userId:ASCENDING,status:ASCENDING'
+    );
+    expect(hasMembershipsGroupIndex).toBe(true);
   });
 });
 

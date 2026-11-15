@@ -50,6 +50,7 @@ import {
   ApiClientError,
   generateIdempotencyKey,
 } from '../../lib/customerApi.ts';
+import { workspaceApi } from '../../lib/workspaceApi.ts';
 import {
   isBatchExpired,
   searchSellableMedicines,
@@ -75,6 +76,7 @@ export const BillingView: React.FC = () => {
     cancelBill,
     processSalesReturn,
     recordBillPayment,
+    refreshLiveWorkspaceData,
     setPrintInvoiceData,
     setActiveQuickModal,
     hasUserPermission,
@@ -137,7 +139,7 @@ export const BillingView: React.FC = () => {
   const [creditOverrideReason, setCreditOverrideReason] = useState('');
   const [isSubmittingBill, setIsSubmittingBill] = useState(false);
 
-  const [customerDiscount, setCustomerDiscount] = useState<number>(store.defaultDiscountPercent || 10);
+  const [customerDiscount, setCustomerDiscount] = useState<number>(store.defaultDiscountPercent ?? 0);
   const [billSuccessMessage, setBillSuccessMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -146,16 +148,20 @@ export const BillingView: React.FC = () => {
   const [returnQuantities, setReturnQuantities] = useState<Record<string, number>>({});
   const [returnReason, setReturnReason] = useState('Customer Return');
   const [restockReturn, setRestockReturn] = useState(true);
+  const [returnModalError, setReturnModalError] = useState<string | null>(null);
 
   // Cancel modal state
   const [selectedInvoiceForCancel, setSelectedInvoiceForCancel] = useState<BillInvoice | null>(null);
   const [cancelReason, setCancelReason] = useState('');
+  const [cancelModalError, setCancelModalError] = useState<string | null>(null);
 
   // Payment collection modal state
   const [selectedInvoiceForPayment, setSelectedInvoiceForPayment] = useState<BillInvoice | null>(null);
   const [collectionAmount, setCollectionAmount] = useState<number>(0);
   const [collectionMode, setCollectionMode] = useState<PaymentMode>('cash');
   const [collectionRef, setCollectionRef] = useState('');
+  const [collectionModalError, setCollectionModalError] = useState<string | null>(null);
+  const [isProcessingHistoryAction, setIsProcessingHistoryAction] = useState(false);
 
   // History search state
   const [historySearch, setHistorySearch] = useState('');
@@ -712,8 +718,9 @@ export const BillingView: React.FC = () => {
           status: inv.balanceDue > 0 ? 'credit' : 'completed',
           cashierName: currentUser.name,
         };
-        setBillSuccessMessage(`Cloud Firestore Invoice ${mappedBill.invoiceNumber} committed (₹${mappedBill.grandTotal.toFixed(2)})`);
+        setBillSuccessMessage(`Invoice ${mappedBill.invoiceNumber} saved (₹${mappedBill.grandTotal.toFixed(2)})`);
         setPrintInvoiceData(mappedBill);
+        void refreshLiveWorkspaceData();
       } catch (err) {
         const msg = err instanceof ApiClientError ? err.detail : 'Failed to complete POS checkout';
         setErrorMessage(msg);
@@ -774,6 +781,7 @@ export const BillingView: React.FC = () => {
   // Returns logic
   const handleOpenReturnModal = (invoice: BillInvoice) => {
     setSelectedInvoiceForReturn(invoice);
+    setReturnModalError(null);
     const initialQtys: Record<string, number> = {};
     invoice.items.forEach(item => {
       initialQtys[item.batchId] = 0;
@@ -782,62 +790,152 @@ export const BillingView: React.FC = () => {
     setReturnReason('Patient Medicine Return');
   };
 
-  const handleConfirmReturn = () => {
+  const handleConfirmReturn = async () => {
     if (!selectedInvoiceForReturn) return;
+    setReturnModalError(null);
 
     const returnItems = Object.entries(returnQuantities)
       .filter(([_, qty]) => qty > 0)
       .map(([batchId, quantity]) => ({
         batchId,
         quantity,
-        reason: returnReason,
+        reason: returnReason.trim() || 'Patient Medicine Return',
         restock: restockReturn,
       }));
 
     if (returnItems.length === 0) {
-      alert('Please specify return quantity for at least one item');
+      setReturnModalError('Specify a return quantity for at least one medicine.');
       return;
     }
 
-    processSalesReturn(selectedInvoiceForReturn.id, returnItems, returnReason);
+    if (!returnReason.trim()) {
+      setReturnModalError('Please enter a reason for this return.');
+      return;
+    }
+
+    const invoiceNo = selectedInvoiceForReturn.invoiceNumber;
+    if (isLiveApi) {
+      setIsProcessingHistoryAction(true);
+      try {
+        await workspaceApi.processSalesReturn(
+          apiSession,
+          selectedInvoiceForReturn.id,
+          { items: returnItems, reason: returnReason.trim() },
+          generateIdempotencyKey('ret')
+        );
+        await refreshLiveWorkspaceData();
+      } catch (err) {
+        setReturnModalError(
+          err instanceof Error ? err.message : 'Unable to process sales return.'
+        );
+        setIsProcessingHistoryAction(false);
+        return;
+      } finally {
+        setIsProcessingHistoryAction(false);
+      }
+    } else {
+      processSalesReturn(selectedInvoiceForReturn.id, returnItems, returnReason.trim());
+    }
+
     setSelectedInvoiceForReturn(null);
-    setBillSuccessMessage(`Sales return processed for ${selectedInvoiceForReturn.invoiceNumber}`);
-    setTimeout(() => setBillSuccessMessage(null), 3000);
+    setBillSuccessMessage(`Sales return processed for ${invoiceNo}`);
+    setTimeout(() => setBillSuccessMessage(null), 3500);
   };
 
   // Cancellation logic
-  const handleConfirmCancel = () => {
+  const handleConfirmCancel = async () => {
     if (!selectedInvoiceForCancel) return;
-    if (!cancelReason.trim()) {
-      alert('Please enter a cancellation reason');
+    setCancelModalError(null);
+    if (!cancelReason.trim() || cancelReason.trim().length < 3) {
+      setCancelModalError('Enter a clear cancellation reason (minimum 3 characters).');
       return;
     }
 
-    cancelBill(selectedInvoiceForCancel.id, cancelReason);
+    const invoiceNo = selectedInvoiceForCancel.invoiceNumber;
+    if (isLiveApi) {
+      setIsProcessingHistoryAction(true);
+      try {
+        await workspaceApi.cancelInvoice(
+          apiSession,
+          selectedInvoiceForCancel.id,
+          cancelReason.trim(),
+          generateIdempotencyKey('cancel')
+        );
+        await refreshLiveWorkspaceData();
+      } catch (err) {
+        setCancelModalError(
+          err instanceof Error ? err.message : 'Unable to cancel invoice.'
+        );
+        setIsProcessingHistoryAction(false);
+        return;
+      } finally {
+        setIsProcessingHistoryAction(false);
+      }
+    } else {
+      cancelBill(selectedInvoiceForCancel.id, cancelReason.trim());
+    }
+
     setSelectedInvoiceForCancel(null);
     setCancelReason('');
-    setBillSuccessMessage(`Invoice ${selectedInvoiceForCancel.invoiceNumber} has been cancelled`);
-    setTimeout(() => setBillSuccessMessage(null), 3000);
+    setBillSuccessMessage(`Invoice ${invoiceNo} has been cancelled`);
+    setTimeout(() => setBillSuccessMessage(null), 3500);
   };
 
   // Collection modal logic
   const handleOpenCollectionModal = (invoice: BillInvoice) => {
     setSelectedInvoiceForPayment(invoice);
+    setCollectionModalError(null);
     setCollectionAmount(invoice.balanceDue);
     setCollectionMode('cash');
     setCollectionRef('');
   };
 
-  const handleConfirmCollection = () => {
-    if (!selectedInvoiceForPayment || collectionAmount <= 0) return;
-    recordBillPayment(selectedInvoiceForPayment.id, {
-      mode: collectionMode,
-      amount: collectionAmount,
-      referenceNumber: collectionRef || undefined,
-    });
+  const handleConfirmCollection = async () => {
+    if (!selectedInvoiceForPayment) return;
+    setCollectionModalError(null);
+    if (collectionAmount <= 0 || collectionAmount > selectedInvoiceForPayment.balanceDue) {
+      setCollectionModalError(
+        `Enter a payment amount between ₹1 and ₹${selectedInvoiceForPayment.balanceDue.toFixed(2)}.`
+      );
+      return;
+    }
+
+    const invoiceNo = selectedInvoiceForPayment.invoiceNumber;
+    const paidAmt = collectionAmount;
+    if (isLiveApi) {
+      setIsProcessingHistoryAction(true);
+      try {
+        await workspaceApi.recordInvoicePayment(
+          apiSession,
+          selectedInvoiceForPayment.id,
+          {
+            mode: collectionMode,
+            amount: collectionAmount,
+            referenceNumber: collectionRef.trim() || undefined,
+          },
+          generateIdempotencyKey('col')
+        );
+        await refreshLiveWorkspaceData();
+      } catch (err) {
+        setCollectionModalError(
+          err instanceof Error ? err.message : 'Unable to record payment collection.'
+        );
+        setIsProcessingHistoryAction(false);
+        return;
+      } finally {
+        setIsProcessingHistoryAction(false);
+      }
+    } else {
+      recordBillPayment(selectedInvoiceForPayment.id, {
+        mode: collectionMode,
+        amount: collectionAmount,
+        referenceNumber: collectionRef.trim() || undefined,
+      });
+    }
+
     setSelectedInvoiceForPayment(null);
-    setBillSuccessMessage(`Payment of ₹${collectionAmount} recorded for ${selectedInvoiceForPayment.invoiceNumber}`);
-    setTimeout(() => setBillSuccessMessage(null), 3000);
+    setBillSuccessMessage(`Payment of ₹${paidAmt.toFixed(2)} recorded for ${invoiceNo}`);
+    setTimeout(() => setBillSuccessMessage(null), 3500);
   };
 
   const filteredBills = useMemo(() => {
@@ -2031,23 +2129,34 @@ export const BillingView: React.FC = () => {
                   onChange={e => setRestockReturn(e.target.checked)}
                   className="rounded text-blue-600"
                 />
-                <span>Restock returned units back to shelf inventory (Non-expired & intact)</span>
+                <span>Restock returned units back to shelf inventory (Non-expired &amp; intact)</span>
               </label>
+
+              {returnModalError && (
+                <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-800 flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+                  <span>{returnModalError}</span>
+                </div>
+              )}
 
               <div className="pt-3 flex justify-end gap-2 border-t border-slate-100">
                 <button
                   type="button"
-                  onClick={() => setSelectedInvoiceForReturn(null)}
+                  onClick={() => {
+                    setSelectedInvoiceForReturn(null);
+                    setReturnModalError(null);
+                  }}
                   className="px-4 py-2 text-xs font-medium text-slate-600 hover:text-slate-900"
                 >
                   Cancel
                 </button>
                 <button
                   type="button"
-                  onClick={handleConfirmReturn}
-                  className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-xs font-semibold shadow-xs"
+                  disabled={isProcessingHistoryAction}
+                  onClick={() => void handleConfirmReturn()}
+                  className="px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow-xs"
                 >
-                  Confirm Sales Return
+                  {isProcessingHistoryAction ? 'Processing...' : 'Confirm Sales Return'}
                 </button>
               </div>
             </div>
@@ -2095,20 +2204,31 @@ export const BillingView: React.FC = () => {
                 />
               </div>
 
+              {cancelModalError && (
+                <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-800 flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+                  <span>{cancelModalError}</span>
+                </div>
+              )}
+
               <div className="pt-2 flex justify-end gap-2 border-t border-slate-100">
                 <button
                   type="button"
-                  onClick={() => setSelectedInvoiceForCancel(null)}
+                  onClick={() => {
+                    setSelectedInvoiceForCancel(null);
+                    setCancelModalError(null);
+                  }}
                   className="px-4 py-2 text-xs font-medium text-slate-600 hover:text-slate-900"
                 >
                   Close
                 </button>
                 <button
                   type="button"
-                  onClick={handleConfirmCancel}
-                  className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-semibold shadow-xs"
+                  disabled={isProcessingHistoryAction}
+                  onClick={() => void handleConfirmCancel()}
+                  className="px-4 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow-xs"
                 >
-                  Void & Cancel Invoice
+                  {isProcessingHistoryAction ? 'Cancelling...' : 'Void & Cancel Invoice'}
                 </button>
               </div>
             </div>
@@ -2186,20 +2306,31 @@ export const BillingView: React.FC = () => {
                 />
               </div>
 
+              {collectionModalError && (
+                <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-800 flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+                  <span>{collectionModalError}</span>
+                </div>
+              )}
+
               <div className="pt-2 flex justify-end gap-2 border-t border-slate-100">
                 <button
                   type="button"
-                  onClick={() => setSelectedInvoiceForPayment(null)}
+                  onClick={() => {
+                    setSelectedInvoiceForPayment(null);
+                    setCollectionModalError(null);
+                  }}
                   className="px-4 py-2 text-xs font-medium text-slate-600 hover:text-slate-900"
                 >
                   Cancel
                 </button>
                 <button
                   type="button"
-                  onClick={handleConfirmCollection}
-                  className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-semibold shadow-xs"
+                  disabled={isProcessingHistoryAction}
+                  onClick={() => void handleConfirmCollection()}
+                  className="px-4 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow-xs"
                 >
-                  Record Payment
+                  {isProcessingHistoryAction ? 'Recording...' : 'Record Payment'}
                 </button>
               </div>
             </div>

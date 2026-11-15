@@ -13,10 +13,17 @@ import {
   AlertCircle,
   LogOut,
   KeyRound,
+  UserPlus,
+  User as UserIcon,
 } from 'lucide-react';
 import { usePharmacy } from '../../context/PharmacyContext.tsx';
 import { UserRole } from '../../types/pharmacy.ts';
-import { requestPasswordReset, signInWithEmail } from '../../lib/firebaseClient.ts';
+import {
+  requestPasswordReset,
+  resendVerificationEmail,
+  signInWithEmail,
+  signUpWithEmail,
+} from '../../lib/firebaseClient.ts';
 
 interface LoginModalProps {
   onEnterWorkspace?: () => void;
@@ -33,9 +40,11 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
     signOutSession,
   } = usePharmacy();
 
-  const [viewMode, setViewMode] = useState<'signin' | 'reset'>('signin');
+  const [viewMode, setViewMode] = useState<'signin' | 'signup' | 'reset'>('signin');
+  const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [loginNotification, setLoginNotification] = useState<string | null>(null);
@@ -58,7 +67,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
         setLoginNotification(null);
         setIsLoginModalOpen(false);
         onEnterWorkspace?.();
-      }, 700);
+      }, 600);
     } catch (err: any) {
       const code = err?.code || '';
       if (code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found') {
@@ -69,6 +78,49 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
         setAuthError('Too many failed attempts. Please wait before retrying or reset your password.');
       } else {
         setAuthError(err?.message || 'Unable to sign in with Firebase Authentication.');
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleFirebaseSignUp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setLoginNotification(null);
+    if (password.length < 6) {
+      setAuthError('Password must be at least 6 characters long.');
+      return;
+    }
+    if (password !== confirmPassword) {
+      setAuthError('Passwords do not match.');
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      const { user } = await signUpWithEmail({
+        email,
+        password,
+        displayName: fullName,
+      });
+      setLoginNotification(
+        `Account created for ${user.email}. Check your email to verify, then complete pharmacy setup.`
+      );
+      setPassword('');
+      setConfirmPassword('');
+      setTimeout(() => {
+        setLoginNotification(null);
+        setIsLoginModalOpen(false);
+        onEnterWorkspace?.();
+      }, 900);
+    } catch (err: any) {
+      const code = err?.code || '';
+      if (code === 'auth/email-already-in-use') {
+        setAuthError('An account with this email already exists. Switch to Sign In instead.');
+      } else if (code === 'auth/weak-password') {
+        setAuthError('Choose a stronger password (at least 6 characters).');
+      } else {
+        setAuthError(err?.message || 'Unable to create Firebase account.');
       }
     } finally {
       setIsSubmitting(false);
@@ -86,6 +138,19 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
       setViewMode('signin');
     } catch (err: any) {
       setAuthError(err?.message || 'Unable to send password reset email.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleResendVerification = async () => {
+    setAuthError(null);
+    setIsSubmitting(true);
+    try {
+      await resendVerificationEmail();
+      setLoginNotification(`Verification email sent to ${firebaseSession.email || 'your email'}.`);
+    } catch (err: any) {
+      setAuthError(err?.message || 'Unable to send verification email.');
     } finally {
       setIsSubmitting(false);
     }
@@ -116,8 +181,8 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
-      <div className="bg-white rounded-2xl max-w-md w-full shadow-2xl border border-slate-200 overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs overflow-y-auto">
+      <div className="bg-white rounded-2xl max-w-md w-full shadow-2xl border border-slate-200 overflow-hidden my-6">
         {/* Header */}
         <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50">
           <div className="flex items-center gap-2.5">
@@ -125,7 +190,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
               P+
             </div>
             <div>
-              <h3 className="text-sm font-bold text-slate-900">PharmaDesk Staff Sign In</h3>
+              <h3 className="text-sm font-bold text-slate-900">PharmaDesk Account</h3>
               <p className="text-[11px] text-slate-500">Firebase Auth &amp; Live Firestore RBAC</p>
             </div>
           </div>
@@ -161,7 +226,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                 <span className="font-semibold text-slate-800">Firebase Auth &amp; App Check:</span>{' '}
                 {firebaseSession.configured
                   ? `Connected to Firebase project. App Check attestation: ${
-                      firebaseSession.appCheckConfigured ? 'Configured' : 'Not configured'
+                      firebaseSession.appCheckConfigured ? 'Configured' : 'Optional / Dev'
                     }.`
                   : 'Set VITE_FIREBASE_* environment variables to sign in against your Firebase project.'}
               </div>
@@ -177,6 +242,28 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
                   Email verified: {firebaseSession.emailVerified ? 'Yes' : 'Pending'}
                 </span>
               </div>
+              {!firebaseSession.emailVerified && (
+                <button
+                  type="button"
+                  disabled={isSubmitting}
+                  onClick={handleResendVerification}
+                  className="w-full py-2 px-3 rounded-lg bg-amber-50 border border-amber-200 hover:bg-amber-100 text-amber-900 text-xs font-semibold"
+                >
+                  Resend Verification Email
+                </button>
+              )}
+              {onEnterWorkspace && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsLoginModalOpen(false);
+                    onEnterWorkspace();
+                  }}
+                  className="w-full py-2 px-3 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold"
+                >
+                  Open Pharmacy Workspace
+                </button>
+              )}
               <button
                 type="button"
                 disabled={isSubmitting}
@@ -188,96 +275,199 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onEnterWorkspace }) => {
               </button>
             </div>
           ) : firebaseSession.configured ? (
-            viewMode === 'signin' ? (
-              <form onSubmit={handleFirebaseSignIn} className="space-y-3">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">Staff Email</label>
-                  <div className="relative">
-                    <Mail className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
-                    <input
-                      type="email"
-                      required
-                      autoComplete="email"
-                      value={email}
-                      onChange={e => setEmail(e.target.value)}
-                      placeholder="pharmacist@yourpharmacy.in"
-                      className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
-                    />
-                  </div>
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">Password</label>
-                  <div className="relative">
-                    <Lock className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
-                    <input
-                      type="password"
-                      required
-                      autoComplete="current-password"
-                      value={password}
-                      onChange={e => setPassword(e.target.value)}
-                      placeholder="Enter your password"
-                      className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
-                    />
-                  </div>
-                </div>
-                <button
-                  type="submit"
-                  disabled={isSubmitting}
-                  className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg shadow-xs disabled:opacity-60"
-                >
-                  {isSubmitting ? 'Signing In...' : 'Sign In with Firebase'}
-                </button>
-                <div className="text-right">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAuthError(null);
-                      setViewMode('reset');
-                    }}
-                    className="text-[11px] font-medium text-blue-600 hover:text-blue-700"
-                  >
-                    Forgot password? Reset via email
-                  </button>
-                </div>
-              </form>
-            ) : (
-              <form onSubmit={handlePasswordReset} className="space-y-3">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">Registered Staff Email</label>
-                  <div className="relative">
-                    <KeyRound className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
-                    <input
-                      type="email"
-                      required
-                      autoComplete="email"
-                      value={email}
-                      onChange={e => setEmail(e.target.value)}
-                      placeholder="pharmacist@yourpharmacy.in"
-                      className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
-                    />
-                  </div>
-                </div>
-                <button
-                  type="submit"
-                  disabled={isSubmitting}
-                  className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg shadow-xs disabled:opacity-60"
-                >
-                  {isSubmitting ? 'Sending Reset Email...' : 'Send Password Reset Link'}
-                </button>
-                <div className="text-right">
+            <div className="space-y-4">
+              {viewMode !== 'reset' && (
+                <div className="grid grid-cols-2 p-1 bg-slate-100 rounded-lg text-xs font-semibold">
                   <button
                     type="button"
                     onClick={() => {
                       setAuthError(null);
                       setViewMode('signin');
                     }}
-                    className="text-[11px] font-medium text-slate-600 hover:text-slate-800"
+                    className={`py-1.5 rounded-md transition-colors ${
+                      viewMode === 'signin'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
                   >
-                    Back to Sign In
+                    Sign In
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthError(null);
+                      setViewMode('signup');
+                    }}
+                    className={`py-1.5 rounded-md transition-colors ${
+                      viewMode === 'signup'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Create Account
                   </button>
                 </div>
-              </form>
-            )
+              )}
+
+              {viewMode === 'signin' ? (
+                <form onSubmit={handleFirebaseSignIn} className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">Staff / Owner Email</label>
+                    <div className="relative">
+                      <Mail className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                      <input
+                        type="email"
+                        required
+                        autoComplete="email"
+                        value={email}
+                        onChange={e => setEmail(e.target.value)}
+                        placeholder="pharmacist@yourpharmacy.in"
+                        className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">Password</label>
+                    <div className="relative">
+                      <Lock className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                      <input
+                        type="password"
+                        required
+                        autoComplete="current-password"
+                        value={password}
+                        onChange={e => setPassword(e.target.value)}
+                        placeholder="Enter your password"
+                        className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
+                      />
+                    </div>
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={isSubmitting}
+                    className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg shadow-xs disabled:opacity-60"
+                  >
+                    {isSubmitting ? 'Signing In...' : 'Sign In with Firebase'}
+                  </button>
+                  <div className="text-right">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAuthError(null);
+                        setViewMode('reset');
+                      }}
+                      className="text-[11px] font-medium text-blue-600 hover:text-blue-700"
+                    >
+                      Forgot password? Reset via email
+                    </button>
+                  </div>
+                </form>
+              ) : viewMode === 'signup' ? (
+                <form onSubmit={handleFirebaseSignUp} className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">Your Full Name *</label>
+                    <div className="relative">
+                      <UserIcon className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                      <input
+                        type="text"
+                        required
+                        value={fullName}
+                        onChange={e => setFullName(e.target.value)}
+                        placeholder="e.g. Rajesh Deshmukh"
+                        className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">Work Email *</label>
+                    <div className="relative">
+                      <Mail className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                      <input
+                        type="email"
+                        required
+                        autoComplete="email"
+                        value={email}
+                        onChange={e => setEmail(e.target.value)}
+                        placeholder="owner@yourpharmacy.in"
+                        className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Password *</label>
+                      <input
+                        type="password"
+                        required
+                        minLength={6}
+                        autoComplete="new-password"
+                        value={password}
+                        onChange={e => setPassword(e.target.value)}
+                        placeholder="Min 6 chars"
+                        className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Confirm *</label>
+                      <input
+                        type="password"
+                        required
+                        minLength={6}
+                        autoComplete="new-password"
+                        value={confirmPassword}
+                        onChange={e => setConfirmPassword(e.target.value)}
+                        placeholder="Re-enter"
+                        className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
+                      />
+                    </div>
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={isSubmitting}
+                    className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg shadow-xs disabled:opacity-60 inline-flex items-center justify-center gap-1.5"
+                  >
+                    <UserPlus className="w-3.5 h-3.5" />
+                    <span>{isSubmitting ? 'Creating Account...' : 'Create Account & Continue'}</span>
+                  </button>
+                </form>
+              ) : (
+                <form onSubmit={handlePasswordReset} className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">Registered Staff Email</label>
+                    <div className="relative">
+                      <KeyRound className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                      <input
+                        type="email"
+                        required
+                        autoComplete="email"
+                        value={email}
+                        onChange={e => setEmail(e.target.value)}
+                        placeholder="pharmacist@yourpharmacy.in"
+                        className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-hidden focus:border-blue-600 focus:ring-1 focus:ring-blue-600"
+                      />
+                    </div>
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={isSubmitting}
+                    className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg shadow-xs disabled:opacity-60"
+                  >
+                    {isSubmitting ? 'Sending Reset Email...' : 'Send Password Reset Link'}
+                  </button>
+                  <div className="text-right">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAuthError(null);
+                        setViewMode('signin');
+                      }}
+                      className="text-[11px] font-medium text-slate-600 hover:text-slate-800"
+                    >
+                      Back to Sign In
+                    </button>
+                  </div>
+                </form>
+              )}
+            </div>
           ) : isProdBuild ? (
             <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800">
               Firebase Web SDK configuration (`VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_PROJECT_ID`, `VITE_FIREBASE_APP_ID`) is required in production builds.

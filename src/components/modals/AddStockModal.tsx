@@ -24,7 +24,8 @@ export const AddStockModal: React.FC = () => {
 
   if (activeQuickModal !== 'stock') return null;
 
-  const currentMed = medicines.find(m => m.id === selectedMedId) || medicines[0];
+  const effectiveMedId = selectedMedId || medicines[0]?.id || '';
+  const currentMed = medicines.find(m => m.id === effectiveMedId) || medicines[0];
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -109,7 +110,7 @@ export const AddStockModal: React.FC = () => {
                 Medicine *
               </label>
               <select
-                value={selectedMedId}
+                value={effectiveMedId}
                 onChange={e => {
                   setSelectedMedId(e.target.value);
                   const m = medicines.find(med => med.id === e.target.value);

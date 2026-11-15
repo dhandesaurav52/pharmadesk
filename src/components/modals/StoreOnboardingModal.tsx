@@ -3,16 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   X,
   Building2,
-  FileText,
-  Printer,
   CheckCircle2,
   ChevronRight,
   ChevronLeft,
-  Shield,
+  AlertCircle,
 } from 'lucide-react';
 import { usePharmacy } from '../../context/PharmacyContext.tsx';
 import { PharmacyStore } from '../../types/pharmacy.ts';
@@ -22,7 +20,17 @@ export const StoreOnboardingModal: React.FC = () => {
 
   const [step, setStep] = useState(1);
   const [formData, setFormData] = useState<PharmacyStore>(store);
+  const [saving, setSaving] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState(false);
+
+  useEffect(() => {
+    if (isStoreOnboardingOpen) {
+      setFormData(store);
+      setErrorMessage(null);
+      setSuccessMessage(false);
+    }
+  }, [isStoreOnboardingOpen, store]);
 
   if (!isStoreOnboardingOpen) return null;
 
@@ -30,14 +38,22 @@ export const StoreOnboardingModal: React.FC = () => {
     setFormData(prev => ({ ...prev, [field]: value }));
   };
 
-  const handleSave = (e: React.FormEvent) => {
+  const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    updateStore(formData);
-    setSuccessMessage(true);
-    setTimeout(() => {
-      setSuccessMessage(false);
-      setIsStoreOnboardingOpen(false);
-    }, 1200);
+    setErrorMessage(null);
+    setSaving(true);
+    try {
+      await Promise.resolve(updateStore(formData));
+      setSuccessMessage(true);
+      setTimeout(() => {
+        setSuccessMessage(false);
+        setIsStoreOnboardingOpen(false);
+      }, 1000);
+    } catch (err: any) {
+      setErrorMessage(err?.detail || err?.message || 'Unable to save store settings.');
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -102,6 +118,13 @@ export const StoreOnboardingModal: React.FC = () => {
             <span>Billing & Invoices</span>
           </button>
         </div>
+
+        {errorMessage && (
+          <div className="mx-6 mt-4 p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800 flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+            <span>{errorMessage}</span>
+          </div>
+        )}
 
         {successMessage ? (
           <div className="p-12 text-center">

@@ -31,7 +31,12 @@ const createTenantSchema = z.object({
   pincode: z.string().regex(/^\d{6}$/, 'Pincode must be exactly 6 digits'),
   contactPhone: z.string().min(10, 'Contact phone is required'),
   contactEmail: z.string().email('Valid contact email is required'),
+  invoicePrefix: z.string().min(2).max(10).optional(),
+  thermalPrinter: z.boolean().optional(),
+  defaultDiscountPercent: z.number().min(0).max(50).optional(),
 });
+
+const updateTenantSchema = createTenantSchema.omit({ tenantId: true }).partial();
 
 /**
  * POST /api/v1/tenants
@@ -63,6 +68,26 @@ tenantRouter.get(
     const { tenantId } = req.tenantContext!;
     const tenant = await TenantService.getTenant(tenantId);
     res.status(200).json({ success: true, data: tenant });
+  })
+);
+
+/**
+ * PATCH /api/v1/tenants/:tenantId
+ * Updates pharmacy details and invoice/printer settings. Owner role required.
+ */
+tenantRouter.patch(
+  '/:tenantId',
+  tenantAuthorizationMiddleware,
+  requireRole('owner'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const { tenantId, userId } = req.tenantContext!;
+    const validated = updateTenantSchema.parse(req.body);
+    const updated = await TenantService.updateTenant(tenantId, userId, validated);
+    res.status(200).json({
+      success: true,
+      message: 'Pharmacy store profile updated',
+      data: updated,
+    });
   })
 );
 

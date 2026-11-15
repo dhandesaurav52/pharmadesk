@@ -10,6 +10,9 @@ import {
   browserLocalPersistence,
   setPersistence,
   signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  updateProfile,
+  sendEmailVerification,
   sendPasswordResetEmail,
   signOut,
   onIdTokenChanged,
@@ -132,6 +135,54 @@ export async function signInWithEmail(email: string, password: string): Promise<
   const idToken = await cred.user.getIdToken();
   const appCheckToken = await getActiveAppCheckToken();
   return { user: cred.user, idToken, appCheckToken };
+}
+
+export async function signUpWithEmail(params: {
+  email: string;
+  password: string;
+  displayName?: string;
+}): Promise<{
+  user: User;
+  idToken: string;
+  appCheckToken: string | null;
+}> {
+  const auth = getFirebaseClientAuth();
+  if (!auth) {
+    throw new Error('Firebase Authentication is not configured in environment variables.');
+  }
+  const cred = await createUserWithEmailAndPassword(auth, params.email.trim(), params.password);
+  if (params.displayName?.trim()) {
+    await updateProfile(cred.user, { displayName: params.displayName.trim() });
+  }
+  try {
+    await sendEmailVerification(cred.user);
+  } catch {
+    // Non-blocking verification dispatch failure (e.g., emulator / rate limits)
+  }
+  const idToken = await cred.user.getIdToken(true);
+  const appCheckToken = await getActiveAppCheckToken();
+  return { user: cred.user, idToken, appCheckToken };
+}
+
+export async function resendVerificationEmail(): Promise<void> {
+  const auth = getFirebaseClientAuth();
+  if (!auth?.currentUser) {
+    throw new Error('Please sign in first to resend your verification email.');
+  }
+  await sendEmailVerification(auth.currentUser);
+}
+
+export async function reloadFirebaseUser(): Promise<{ emailVerified: boolean; idToken: string | null }> {
+  const auth = getFirebaseClientAuth();
+  if (!auth?.currentUser) {
+    return { emailVerified: false, idToken: null };
+  }
+  await auth.currentUser.reload();
+  const idToken = await auth.currentUser.getIdToken(true);
+  return {
+    emailVerified: Boolean(auth.currentUser.emailVerified),
+    idToken,
+  };
 }
 
 export async function requestPasswordReset(email: string): Promise<void> {

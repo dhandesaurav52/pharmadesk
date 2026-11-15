@@ -1,6 +1,14 @@
 {
   "indexes": [
     {
+      "collectionGroup": "memberships",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "medicines",
       "queryScope": "COLLECTION",
       "fields": [
