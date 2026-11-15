@@ -10,6 +10,8 @@ import {
   browserLocalPersistence,
   setPersistence,
   signInWithEmailAndPassword,
+  signInWithPopup,
+  GoogleAuthProvider,
   createUserWithEmailAndPassword,
   updateProfile,
   sendEmailVerification,
@@ -19,6 +21,12 @@ import {
   connectAuthEmulator,
   User,
 } from 'firebase/auth';
+import {
+  getFirestore,
+  Firestore,
+  doc,
+  getDocFromServer,
+} from 'firebase/firestore';
 import {
   initializeAppCheck,
   AppCheck,
@@ -31,27 +39,65 @@ export interface FirebaseClientStatus {
   configured: boolean;
   projectId: string | null;
   authDomain: string | null;
+  firestoreDatabaseId: string | null;
   appCheckConfigured: boolean;
   emulatorConnected: boolean;
 }
 
+interface AppletFirebaseConfigJson {
+  apiKey?: string;
+  authDomain?: string;
+  projectId?: string;
+  storageBucket?: string;
+  messagingSenderId?: string;
+  appId?: string;
+  firestoreDatabaseId?: string;
+  recaptchaSiteKey?: string;
+}
+
+const appletConfigModules = import.meta.glob('/firebase-applet-config.json', {
+  eager: true,
+}) as Record<string, { default?: AppletFirebaseConfigJson } | AppletFirebaseConfigJson>;
+
+function readAppletConfig(): AppletFirebaseConfigJson {
+  const mod = appletConfigModules['/firebase-applet-config.json'];
+  if (!mod) return {};
+  return ('default' in mod && mod.default ? mod.default : mod) as AppletFirebaseConfigJson;
+}
+
+const appletConfig = readAppletConfig();
+
 const firebaseConfig = {
-  apiKey: String(import.meta.env.VITE_FIREBASE_API_KEY || '').trim(),
-  authDomain: String(import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || '').trim(),
-  projectId: String(import.meta.env.VITE_FIREBASE_PROJECT_ID || '').trim(),
-  storageBucket: String(import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || '').trim(),
-  messagingSenderId: String(import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '').trim(),
-  appId: String(import.meta.env.VITE_FIREBASE_APP_ID || '').trim(),
+  apiKey: String(import.meta.env.VITE_FIREBASE_API_KEY || appletConfig.apiKey || '').trim(),
+  authDomain: String(import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || appletConfig.authDomain || '').trim(),
+  projectId: String(import.meta.env.VITE_FIREBASE_PROJECT_ID || appletConfig.projectId || '').trim(),
+  storageBucket: String(
+    import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || appletConfig.storageBucket || ''
+  ).trim(),
+  messagingSenderId: String(
+    import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || appletConfig.messagingSenderId || ''
+  ).trim(),
+  appId: String(import.meta.env.VITE_FIREBASE_APP_ID || appletConfig.appId || '').trim(),
 };
 
-const recaptchaSiteKey = String(import.meta.env.VITE_FIREBASE_APPCHECK_RECAPTCHA_SITE_KEY || '').trim();
-const appCheckProviderType = String(import.meta.env.VITE_FIREBASE_APPCHECK_PROVIDER || 'v3').trim().toLowerCase();
+const firestoreDatabaseId = String(
+  import.meta.env.VITE_FIRESTORE_DATABASE_ID || appletConfig.firestoreDatabaseId || ''
+).trim();
+
+const recaptchaSiteKey = String(
+  import.meta.env.VITE_FIREBASE_APPCHECK_RECAPTCHA_SITE_KEY || appletConfig.recaptchaSiteKey || ''
+).trim();
+const appCheckProviderType = String(import.meta.env.VITE_FIREBASE_APPCHECK_PROVIDER || 'v3')
+  .trim()
+  .toLowerCase();
 const authEmulatorUrl = String(import.meta.env.VITE_FIREBASE_AUTH_EMULATOR_URL || '').trim();
 
 let appInstance: FirebaseApp | null = null;
 let authInstance: Auth | null = null;
+let dbInstance: Firestore | null = null;
 let appCheckInstance: AppCheck | null = null;
 let emulatorConnected = false;
+let connectionCheckRan = false;
 
 export function isFirebaseClientConfigured(): boolean {
   return Boolean(
@@ -67,6 +113,7 @@ export function getFirebaseClientStatus(): FirebaseClientStatus {
     configured: isFirebaseClientConfigured(),
     projectId: firebaseConfig.projectId || null,
     authDomain: firebaseConfig.authDomain || null,
+    firestoreDatabaseId: firestoreDatabaseId || null,
     appCheckConfigured: Boolean(recaptchaSiteKey),
     emulatorConnected,
   };
@@ -101,9 +148,30 @@ function ensureFirebaseApp(): FirebaseApp | null {
   return appInstance;
 }
 
+export function getFirebaseClientDb(): Firestore | null {
+  const app = ensureFirebaseApp();
+  if (!app) return null;
+  if (!dbInstance) {
+    dbInstance =
+      firestoreDatabaseId && firestoreDatabaseId !== '(default)'
+        ? getFirestore(app, firestoreDatabaseId)
+        : getFirestore(app);
+  }
+  if (typeof window !== 'undefined' && !connectionCheckRan) {
+    connectionCheckRan = true;
+    void getDocFromServer(doc(dbInstance, 'health', 'ping')).catch((error) => {
+      if (error instanceof Error && error.message.includes('the client is offline')) {
+        console.error('Please check your Firebase configuration.');
+      }
+    });
+  }
+  return dbInstance;
+}
+
 export function getFirebaseClientAuth(): Auth | null {
   const app = ensureFirebaseApp();
   if (!app) return null;
+  getFirebaseClientDb();
 
   if (!authInstance) {
     authInstance = getAuth(app);
@@ -129,9 +197,26 @@ export async function signInWithEmail(email: string, password: string): Promise<
 }> {
   const auth = getFirebaseClientAuth();
   if (!auth) {
-    throw new Error('Firebase Authentication is not configured in environment variables.');
+    throw new Error('Firebase Authentication is not configured.');
   }
   const cred = await signInWithEmailAndPassword(auth, email.trim(), password);
+  const idToken = await cred.user.getIdToken();
+  const appCheckToken = await getActiveAppCheckToken();
+  return { user: cred.user, idToken, appCheckToken };
+}
+
+export async function signInWithGoogle(): Promise<{
+  user: User;
+  idToken: string;
+  appCheckToken: string | null;
+}> {
+  const auth = getFirebaseClientAuth();
+  if (!auth) {
+    throw new Error('Firebase Authentication is not configured.');
+  }
+  const provider = new GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: 'select_account' });
+  const cred = await signInWithPopup(auth, provider);
   const idToken = await cred.user.getIdToken();
   const appCheckToken = await getActiveAppCheckToken();
   return { user: cred.user, idToken, appCheckToken };
@@ -148,7 +233,7 @@ export async function signUpWithEmail(params: {
 }> {
   const auth = getFirebaseClientAuth();
   if (!auth) {
-    throw new Error('Firebase Authentication is not configured in environment variables.');
+    throw new Error('Firebase Authentication is not configured.');
   }
   const cred = await createUserWithEmailAndPassword(auth, params.email.trim(), params.password);
   if (params.displayName?.trim()) {
@@ -188,7 +273,7 @@ export async function reloadFirebaseUser(): Promise<{ emailVerified: boolean; id
 export async function requestPasswordReset(email: string): Promise<void> {
   const auth = getFirebaseClientAuth();
   if (!auth) {
-    throw new Error('Firebase Authentication is not configured in environment variables.');
+    throw new Error('Firebase Authentication is not configured.');
   }
   await sendPasswordResetEmail(auth, email.trim());
 }

@@ -4,9 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --port=3000 --host=0.0.0.0",
+    "dev": "tsx server.ts",
     "dev:frontend": "vite --port=3000 --host=0.0.0.0",
     "dev:backend": "tsx server/src/server.ts",
+    "start": "node server.ts",
     "build": "vite build",
     "build:frontend": "vite build",
     "build:backend": "esbuild server/src/server.ts --bundle --platform=node --target=node20 --format=esm --packages=external --outfile=dist/server/server.js",

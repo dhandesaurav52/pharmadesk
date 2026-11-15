@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { adminAuth, appCheck } from '../lib/firebaseAdmin';
+import { adminAuth, appCheck, hasProjectAdminCredentials } from '../lib/firebaseAdmin';
 import { UnauthorizedError, ForbiddenError } from '../lib/errors';
 import { env } from '../config/env';
 import { logger } from '../lib/logger';
@@ -67,7 +67,8 @@ export async function firebaseAuthMiddleware(
 
     // 3. Verify ID Token with Firebase Admin SDK
     try {
-      const decodedToken = await adminAuth().verifyIdToken(idToken, true /* checkRevoked */);
+      const checkRevoked = hasProjectAdminCredentials();
+      const decodedToken = await adminAuth().verifyIdToken(idToken, checkRevoked);
 
       req.user = {
         uid: decodedToken.uid,

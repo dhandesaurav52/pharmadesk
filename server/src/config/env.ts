@@ -1,8 +1,34 @@
 import { z } from 'zod';
 import dotenv from 'dotenv';
+import fs from 'node:fs';
+import path from 'node:path';
 
 // Load .env if present (non-fatal if absent)
 dotenv.config();
+
+interface FirebaseAppletConfigFile {
+  projectId?: string;
+  storageBucket?: string;
+  firestoreDatabaseId?: string;
+}
+
+function readFirebaseAppletConfig(): FirebaseAppletConfigFile {
+  try {
+    const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+    if (fs.existsSync(configPath)) {
+      const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      if (parsed && typeof parsed === 'object') {
+        return parsed as FirebaseAppletConfigFile;
+      }
+    }
+  } catch {
+    // Non-fatal fallback
+  }
+  return {};
+}
+
+const appletFirebaseConfig = readFirebaseAppletConfig();
+
 const envSchema = z.object({
   NODE_ENV: z
     .enum(['development', 'production', 'test'])
@@ -57,7 +83,13 @@ const envSchema = z.object({
     .string()
     .trim()
     .min(1, 'FIREBASE_PROJECT_ID is required')
-    .default(process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT || 'pharmadesk-cloud'),
+    .default(
+      process.env.FIREBASE_PROJECT_ID ||
+        appletFirebaseConfig.projectId ||
+        process.env.GOOGLE_CLOUD_PROJECT ||
+        process.env.GCLOUD_PROJECT ||
+        'pharmadesk-cloud'
+    ),
   FIREBASE_CLIENT_EMAIL: z.string().trim().optional(),
   FIREBASE_PRIVATE_KEY: z.string().optional(),
   FIREBASE_STORAGE_BUCKET: z
@@ -66,8 +98,14 @@ const envSchema = z.object({
     .min(1, 'FIREBASE_STORAGE_BUCKET is required')
     .default(
       process.env.FIREBASE_STORAGE_BUCKET ||
-      `${process.env.GOOGLE_CLOUD_PROJECT || 'pharmadesk-cloud'}.appspot.com`
+        appletFirebaseConfig.storageBucket ||
+        `${appletFirebaseConfig.projectId || process.env.GOOGLE_CLOUD_PROJECT || 'pharmadesk-cloud'}.appspot.com`
     ),
+  FIRESTORE_DATABASE_ID: z
+    .string()
+    .trim()
+    .optional()
+    .default(process.env.FIRESTORE_DATABASE_ID || appletFirebaseConfig.firestoreDatabaseId || ''),
   FIREBASE_APP_CHECK_REQUIRED: z
     .string()
     .default('false')

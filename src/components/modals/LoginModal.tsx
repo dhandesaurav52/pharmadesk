@@ -22,6 +22,7 @@ import {
   requestPasswordReset,
   resendVerificationEmail,
   signInWithEmail,
+  signInWithGoogle,
   signUpWithEmail,
 } from '../../lib/firebaseClient.ts';
 
@@ -80,8 +81,41 @@ export const LoginModal: React.FC<LoginModalProps> = ({
         setAuthError('This account has been disabled. Contact your pharmacy owner.');
       } else if (code === 'auth/too-many-requests') {
         setAuthError('Too many failed attempts. Please wait a few minutes or reset your password.');
+      } else if (code === 'auth/operation-not-allowed') {
+        setAuthError(
+          'Email/password sign-in is not yet enabled in Firebase Console. Click "Continue with Google" below or enable Email/Password under Authentication → Sign-in method.'
+        );
       } else {
         setAuthError(err?.message || 'Unable to sign in right now. Please try again.');
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setAuthError(null);
+    setLoginNotification(null);
+    setIsSubmitting(true);
+    try {
+      const { user, idToken, appCheckToken } = await signInWithGoogle();
+      await refreshMemberships({ bearerToken: idToken, appCheckToken });
+      setLoginNotification(`Signed in as ${user.email || 'your Google account'}`);
+      setTimeout(() => {
+        setLoginNotification(null);
+        setIsLoginModalOpen(false);
+        onEnterWorkspace?.();
+      }, 400);
+    } catch (err: any) {
+      const code = err?.code || '';
+      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        setAuthError('Google sign-in was cancelled. Please try again.');
+      } else if (code === 'auth/popup-blocked') {
+        setAuthError('Pop-up was blocked by your browser. Please allow pop-ups for this site and try again.');
+      } else if (code === 'auth/user-disabled') {
+        setAuthError('This account has been disabled. Contact your pharmacy owner.');
+      } else {
+        setAuthError(err?.message || 'Unable to sign in with Google right now.');
       }
     } finally {
       setIsSubmitting(false);
@@ -128,6 +162,10 @@ export const LoginModal: React.FC<LoginModalProps> = ({
         setAuthError('An account with this email already exists. Please sign in instead.');
       } else if (code === 'auth/weak-password') {
         setAuthError('Please choose a stronger password (at least 6 characters).');
+      } else if (code === 'auth/operation-not-allowed') {
+        setAuthError(
+          'Email/password sign-up is not yet enabled in Firebase Console. Click "Continue with Google" below or enable Email/Password under Authentication → Sign-in method.'
+        );
       } else {
         setAuthError(err?.message || 'Unable to create your account right now.');
       }
@@ -538,6 +576,44 @@ export const LoginModal: React.FC<LoginModalProps> = ({
                     </button>
                   </div>
                 </form>
+              )}
+
+              {viewMode !== 'reset' && (
+                <div className="space-y-3">
+                  <div className="relative flex items-center justify-center">
+                    <div className="border-t border-slate-200 w-full" />
+                    <span className="bg-white px-2.5 text-[11px] font-medium text-slate-400 shrink-0">
+                      or continue with
+                    </span>
+                    <div className="border-t border-slate-200 w-full" />
+                  </div>
+                  <button
+                    type="button"
+                    disabled={isSubmitting}
+                    onClick={handleGoogleSignIn}
+                    className="w-full py-2.5 px-4 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-xs font-semibold inline-flex items-center justify-center gap-2 transition-colors disabled:opacity-60"
+                  >
+                    <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                      <path
+                        fill="#4285F4"
+                        d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+                      />
+                      <path
+                        fill="#34A853"
+                        d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+                      />
+                      <path
+                        fill="#FBBC05"
+                        d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+                      />
+                      <path
+                        fill="#EA4335"
+                        d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+                      />
+                    </svg>
+                    <span>Continue with Google</span>
+                  </button>
+                </div>
               )}
 
               {onJoinPharmacy && (

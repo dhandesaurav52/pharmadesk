@@ -195,6 +195,17 @@ export function getConfiguredFirebaseProjectInfo(): {
   };
 }
 
+export function hasProjectAdminCredentials(config: EnvConfig = env): boolean {
+  const hasServiceAccount = Boolean(
+    config.FIREBASE_CLIENT_EMAIL?.trim() && config.FIREBASE_PRIVATE_KEY?.trim()
+  );
+  if (hasServiceAccount) return true;
+  if (hasEmulatorHost(config)) return true;
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) return true;
+  const gcpProject = (process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT || '').trim();
+  return Boolean(gcpProject && gcpProject === config.FIREBASE_PROJECT_ID.trim());
+}
+
 /**
  * Returns Firestore singleton database instance bound to the same Firebase App.
  */
@@ -204,7 +215,9 @@ export function getFirestoreDb(): Firestore {
   }
 
   const app = getFirebaseAdminApp();
-  firestoreInstance = getFirestore(app);
+  const databaseId = (env.FIRESTORE_DATABASE_ID || '').trim();
+  firestoreInstance =
+    databaseId && databaseId !== '(default)' ? getFirestore(app, databaseId) : getFirestore(app);
   try {
     firestoreInstance.settings({
       ignoreUndefinedProperties: true,

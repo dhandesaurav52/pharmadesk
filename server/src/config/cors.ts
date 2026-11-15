@@ -1,11 +1,15 @@
-import { CorsOptions } from 'cors';
+import { CorsOptions, CorsOptionsDelegate } from 'cors';
+import { Request } from 'express';
 import { env } from './env';
 
 /**
  * Builds CORS configuration options for Express.
  * Rejects disallowed origins without using wildcards with credentials.
  */
-export function createCorsOptions(allowedOrigins = env.CORS_ALLOWED_ORIGINS, nodeEnv = env.NODE_ENV): CorsOptions {
+export function createCorsOptions(
+  allowedOrigins = env.CORS_ALLOWED_ORIGINS,
+  nodeEnv = env.NODE_ENV
+): CorsOptions {
   const sanitizedOrigins = allowedOrigins.filter((origin) => origin && origin !== '*');
 
   return {
@@ -17,10 +21,11 @@ export function createCorsOptions(allowedOrigins = env.CORS_ALLOWED_ORIGINS, nod
 
       // Check if origin matches allowed origins
       const isAllowed = sanitizedOrigins.some((allowed) => {
-        // Direct match
         if (allowed === origin) return true;
-        // Allow localhost on any dev port in development mode
         if (nodeEnv === 'development' && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+          return true;
+        }
+        if (nodeEnv === 'development' && /^https:\/\/[a-z0-9-]+\.run\.app$/i.test(origin)) {
           return true;
         }
         return false;
@@ -57,5 +62,35 @@ export function createCorsOptions(allowedOrigins = env.CORS_ALLOWED_ORIGINS, nod
       'Retry-After',
     ],
     maxAge: 86400, // 24 hours
+  };
+}
+
+/**
+ * Wraps createCorsOptions with strict same-origin support when frontend and API share a host.
+ */
+export function createRequestCorsOptions(
+  allowedOrigins = env.CORS_ALLOWED_ORIGINS,
+  nodeEnv = env.NODE_ENV
+): CorsOptionsDelegate<Request> {
+  const baseOptions = createCorsOptions(allowedOrigins, nodeEnv);
+  return (req, callback) => {
+    const requestOrigin = req.headers.origin;
+    const forwardedHost = String(req.headers['x-forwarded-host'] || req.headers.host || '')
+      .split(',')[0]
+      .trim()
+      .toLowerCase();
+
+    if (requestOrigin && forwardedHost) {
+      try {
+        const originHost = new URL(requestOrigin).host.toLowerCase();
+        if (originHost === forwardedHost) {
+          return callback(null, { ...baseOptions, origin: true });
+        }
+      } catch {
+        // Fall through to strict base origin policy
+      }
+    }
+
+    return callback(null, baseOptions);
   };
 }

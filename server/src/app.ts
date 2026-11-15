@@ -3,7 +3,7 @@ import helmet from 'helmet';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import { env, EnvConfig } from './config/env';
-import { createCorsOptions } from './config/cors';
+import { createRequestCorsOptions } from './config/cors';
 import { requestIdMiddleware } from './middleware/requestId';
 import { errorHandlerMiddleware } from './middleware/errorHandler';
 import { notFoundMiddleware } from './middleware/notFound';
@@ -14,6 +14,7 @@ import { RateLimitError } from './lib/errors';
 export interface AppOptions {
   config?: EnvConfig;
   corsAllowedOrigins?: string[];
+  serveFrontend?: boolean;
 }
 
 /**
@@ -61,9 +62,14 @@ export function createApp(options?: AppOptions): Express {
   // 3. Security Headers via Helmet
   app.use(
     helmet({
-      contentSecurityPolicy: currentEnv.NODE_ENV === 'production',
+      contentSecurityPolicy: options?.serveFrontend
+        ? false
+        : currentEnv.NODE_ENV === 'production',
       crossOriginEmbedderPolicy: false,
-      frameguard: { action: 'deny' },
+      crossOriginOpenerPolicy: options?.serveFrontend
+        ? { policy: 'same-origin-allow-popups' }
+        : true,
+      frameguard: options?.serveFrontend ? false : { action: 'deny' },
       referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
       hsts: currentEnv.NODE_ENV === 'production'
         ? { maxAge: 31536000, includeSubDomains: true, preload: true }
@@ -74,7 +80,7 @@ export function createApp(options?: AppOptions): Express {
   // 4. Cross-Origin Resource Sharing (CORS)
   app.use(
     cors(
-      createCorsOptions(
+      createRequestCorsOptions(
         options?.corsAllowedOrigins ?? currentEnv.CORS_ALLOWED_ORIGINS,
         currentEnv.NODE_ENV
       )
@@ -151,17 +157,22 @@ export function createApp(options?: AppOptions): Express {
   // 8. Mount Versioned API Routes
   app.use(currentEnv.API_PREFIX, apiRouter);
 
-  // Root fallback endpoint
-  app.get('/', (_req: Request, res: Response) => {
-    res.status(200).json({
-      name: 'PharmaDesk Server',
-      status: 'online',
-      apiDocs: `${currentEnv.API_PREFIX}`,
+  if (options?.serveFrontend) {
+    // Scope JSON 404 exclusively to unmatched API routes so SPA/Vite middleware handles page routes
+    app.use(currentEnv.API_PREFIX, notFoundMiddleware);
+  } else {
+    // Root fallback endpoint for standalone API deployments
+    app.get('/', (_req: Request, res: Response) => {
+      res.status(200).json({
+        name: 'PharmaDesk Server',
+        status: 'online',
+        apiDocs: `${currentEnv.API_PREFIX}`,
+      });
     });
-  });
 
-  // 9. 404 Not Found Handler (Must be registered after routes)
-  app.use(notFoundMiddleware);
+    // 9. 404 Not Found Handler (Must be registered after routes)
+    app.use(notFoundMiddleware);
+  }
 
   // 10. Centralized RFC 7807 Error Handler (Must be registered last)
   app.use(errorHandlerMiddleware);
